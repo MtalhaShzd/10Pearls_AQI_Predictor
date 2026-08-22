@@ -690,7 +690,7 @@ Pearls_AQI_Predictor/
 ## 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/MtalhaShzd/10Pearls_AQI_Predictor.git
 cd Pearls_AQI_Predictor
 ```
 
