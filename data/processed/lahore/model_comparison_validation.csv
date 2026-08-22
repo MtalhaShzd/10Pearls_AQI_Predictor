@@ -1,0 +1,6 @@
+Model,Dataset,MAE,RMSE,R2
+Ridge Regression,Validation,1.0044,1.5177,0.9988
+Baseline (Persistence),Validation,1.193,1.8827,0.9981
+XGBoost,Validation,1.079,2.496,0.9966
+Random Forest,Validation,1.6369,2.6725,0.9961
+LSTM,Validation,4.3263,5.7691,0.9819

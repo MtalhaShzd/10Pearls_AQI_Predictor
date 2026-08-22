@@ -1,0 +1,2 @@
+Model,Dataset,MAE,RMSE,R2
+Ridge Regression,TEST (Final),2.8946,4.6925,0.9868
