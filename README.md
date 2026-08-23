@@ -553,7 +553,7 @@ Every hour
 ### Schedule
 
 ```text
-Every day at 02:00 UTC
+Every day at 02:00 UTC & PST 07:00
 ```
 
 ### Tasks
