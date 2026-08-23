@@ -58,11 +58,12 @@ def fetch_current_weather():
         "wind_direction_10m": hourly["wind_direction_10m"],
     })
 
-    #  Filter out any future timestamps
+    # Filter out any future timestamps
     now = pd.Timestamp.now(tz=df["datetime"].dt.tz)
     df = df[df["datetime"] <= now]
     df = df.dropna()
     return df
+
 
 def fetch_current_pollutants():
     """
@@ -183,9 +184,8 @@ def run_hourly_pipeline():
     if DATA_PATH.exists():
         existing_df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
         print(f"Existing data: {len(existing_df)} rows")
-        
-        # CLEANUP: Remove any future timestamps that may have been added
-        # by previous versions of the pipeline
+
+        # CLEANUP: Remove any future timestamps from previous runs
         original_count = len(existing_df)
         existing_df = existing_df[
             existing_df["datetime"] <= pd.Timestamp.now(tz=existing_df["datetime"].dt.tz)
@@ -197,7 +197,7 @@ def run_hourly_pipeline():
     else:
         existing_df = pd.DataFrame()
         print("No existing data found, starting fresh")
-        
+
     # 2. Fetch latest weather
     print("\n📡 Fetching current weather data...")
     weather_df = fetch_current_weather()
@@ -255,7 +255,14 @@ def run_hourly_pipeline():
             fs = project.get_feature_store()
             fg = fs.get_feature_group("lahore_air_quality_features", version=1)
 
-            new_data = combined_df.tail(len(new_rows) + 24)
+            new_data = combined_df.tail(len(new_rows) + 24).copy()
+
+            # FIX: Ensure integer columns match Hopsworks schema ('bigint' = int64)
+            int_cols = ["hour", "day", "month", "day_of_week", "is_weekend"]
+            for col in int_cols:
+                if col in new_data.columns:
+                    new_data[col] = new_data[col].astype("int64")
+
             fg.insert(new_data, wait=True)
             print("✅ Hopsworks upload complete")
         else:
