@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import os
 
+
 # ═══════════════════════════════════════════════════════════
 # STREAMLIT CONFIGURATION (DARK MODE)
 # ═══════════════════════════════════════════════════════════
@@ -139,26 +140,45 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-API_BASE = os.getenv("API_URL", "https://one0pearls-aqi-predictor.onrender.com")
+API_BASE = os.getenv("API_URL", "https://one0pearls-aqi-predictor.onrender.com").rstrip("/")
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_current():
-    r = requests.get(f"{API_BASE}/api/current", timeout=10)
-    return r.json()["data"] if r.status_code == 200 else None
+    try:
+        r = requests.get(f"{API_BASE}/api/current", timeout=60)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("data")
+        st.warning(f"⚠️ API `/api/current` returned status code {r.status_code}")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.warning(f"⏳ Connecting to Render API: {e}")
+        return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_forecast():
-    r = requests.get(f"{API_BASE}/api/forecast", timeout=60)
-    return r.json() if r.status_code == 200 else None
+    try:
+        r = requests.get(f"{API_BASE}/api/forecast", timeout=60)
+        if r.status_code == 200:
+            return r.json()
+        st.warning(f"⚠️ API `/api/forecast` returned status code {r.status_code}")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.warning(f"⏳ Connecting to Render API: {e}")
+        return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_shap(horizon):
-    r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=30)
-    return r.json() if r.status_code == 200 else None
-
+    try:
+        r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=45)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except requests.exceptions.RequestException:
+        return None
 
 def get_aqi_category(aqi):
     if aqi <= 50:
@@ -225,13 +245,14 @@ with c3:
 st.markdown("---")
 
 try:
-    current = fetch_current()
-    forecast = fetch_forecast()
+    with st.spinner("⏳ Loading real-time data from Render API..."):
+        current = fetch_current()
+        forecast = fetch_forecast()
 
     if not current or not forecast:
-        st.error("❌ Failed to fetch data. Ensure `python api/app.py` is running.")
+        st.error("❌ Could not load live data from backend API.")
+        st.info("💡 Render free instances take ~40 seconds to wake up from sleep. Please wait 30 seconds and click **🔄 Refresh Data**.")
         st.stop()
-
     # ═══════════════════════════════════════════════════════════
     # POLLUTANT CARDS
     # ═══════════════════════════════════════════════════════════
