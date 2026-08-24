@@ -1,3 +1,5 @@
+# api/app.py
+
 import sys
 from pathlib import Path
 from flask import Flask, jsonify
@@ -7,23 +9,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 from src.forecast_engine import (
-    generate_72h_forecast, get_current_conditions,
-    get_shap_explanation, MODEL_METRICS
+    generate_72h_forecast,
+    get_current_conditions,
+    get_shap_explanation,
+    get_model_metrics,
+    get_data_source_info,
 )
+from src.hopsworks_store import load_model_artifacts, get_features_df
 
 app = Flask(__name__)
 CORS(app)
-
-
-def safe_metrics(metrics_dict):
-    """Cast all metric values to native Python float to prevent JSON serialization errors."""
-    safe = {}
-    for k, v in metrics_dict.items():
-        try:
-            safe[k] = float(v)
-        except (TypeError, ValueError):
-            safe[k] = v
-    return safe
 
 
 @app.route("/", methods=["GET"])
@@ -36,11 +31,39 @@ def health():
     return jsonify({"status": "ok", "service": "Lahore AQI API"}), 200
 
 
+@app.route("/routes", methods=["GET"])
+def list_routes():
+    return jsonify({
+        "routes": sorted([str(r.rule) for r in app.url_map.iter_rules()])
+    }), 200
+
+
+@app.route("/api/source", methods=["GET"])
+def api_source():
+    try:
+        return jsonify({"success": True, "source": get_data_source_info()}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/reload", methods=["GET", "POST"])
+def api_reload():
+    try:
+        _, _, metrics = load_model_artifacts(force_refresh=True)
+        df = get_features_df(force_refresh=True)
+        return jsonify({
+            "success": True,
+            "metrics": metrics,
+            "feature_rows": int(len(df))
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/current", methods=["GET"])
 def api_current_conditions():
     try:
-        data = get_current_conditions()
-        return jsonify({"success": True, "data": data}), 200
+        return jsonify({"success": True, "data": get_current_conditions()}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -49,7 +72,7 @@ def api_current_conditions():
 def api_forecast():
     try:
         forecast_df = generate_72h_forecast()
-        forecast_df["datetime"] = forecast_df["datetime"].dt.strftime('%Y-%m-%d %H:%M:%S')
+        forecast_df["datetime"] = forecast_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
         predictions = []
         for _, row in forecast_df.iterrows():
@@ -66,6 +89,7 @@ def api_forecast():
                 label = "Very Unhealthy"
             else:
                 label = "Hazardous"
+
             predictions.append({
                 "datetime": str(row["datetime"]),
                 "predicted_aqi": round(aqi, 2),
@@ -76,7 +100,8 @@ def api_forecast():
             "success": True,
             "city": "Lahore",
             "predictions": predictions,
-            "model_metrics": safe_metrics(MODEL_METRICS)
+            "model_metrics": get_model_metrics(),
+            "source": get_data_source_info()
         }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -86,7 +111,11 @@ def api_forecast():
 def api_shap(horizon):
     try:
         contributions = get_shap_explanation(horizon)
-        return jsonify({"success": True, "horizon": horizon, "contributions": contributions}), 200
+        return jsonify({
+            "success": True,
+            "horizon": horizon,
+            "contributions": contributions
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
