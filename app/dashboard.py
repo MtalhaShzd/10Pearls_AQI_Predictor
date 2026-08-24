@@ -5,6 +5,7 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
+import os
 
 # ═══════════════════════════════════════════════════════════
 # STREAMLIT CONFIGURATION (DARK MODE)
@@ -138,7 +139,7 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-API_BASE = "http://127.0.0.1:5000"
+API_BASE = os.getenv("API_URL", "https://one0pearls-aqi-predictor.onrender.com")
 
 
 @st.cache_data(ttl=300)
