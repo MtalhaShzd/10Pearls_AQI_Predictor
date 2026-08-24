@@ -146,7 +146,7 @@ API_BASE = os.getenv("API_URL", "https://one0pearls-aqi-predictor.onrender.com")
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_current():
     try:
-        r = requests.get(f"{API_BASE}/api/current", timeout=60)
+        r = requests.get(f"{API_BASE}/api/current", timeout=120)
         if r.status_code == 200:
             data = r.json()
             return data.get("data")
@@ -160,7 +160,7 @@ def fetch_current():
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_forecast():
     try:
-        r = requests.get(f"{API_BASE}/api/forecast", timeout=60)
+        r = requests.get(f"{API_BASE}/api/forecast", timeout=120)
         if r.status_code == 200:
             return r.json()
         st.warning(f"⚠️ API `/api/forecast` returned status code {r.status_code}")
@@ -173,7 +173,7 @@ def fetch_forecast():
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_shap(horizon):
     try:
-        r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=45)
+        r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=60)
         if r.status_code == 200:
             return r.json()
         return None
