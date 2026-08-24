@@ -1,39 +1,32 @@
-"""Try several insert strategies to find one that works."""
-
-import os
-import time
-import pandas as pd
-from dotenv import load_dotenv
-
-load_dotenv()
-
-df = pd.read_csv("data/processed/lahore/lahore_features_hourly.csv", parse_dates=["datetime"])
-df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-df = df.sort_values("datetime").tail(24).reset_index(drop=True)
-
-print(f"Test payload: {len(df)} rows, {df['datetime'].min()} -> {df['datetime'].max()}\n")
-
 import hopsworks
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-project = hopsworks.login(api_key_value=os.getenv("HOPSWORKS_API_KEY"))
-fs = project.get_feature_store()
-fg = fs.get_feature_group("lahore_air_quality_features", version=1)
+def test_isolated_upload():
+    project = hopsworks.login()
+    fs = project.get_feature_store()
 
-strategies = [
-    ("A: default",                {}),
-    ("B: no offline materialization", {"start_offline_materialization": False}),
-    ("C: wait for job",           {"wait_for_job": True}),
-    ("D: internal_kafka False",   {"internal_kafka": False}),
-]
+    now = datetime.utcnow()
+    df = pd.DataFrame({
+        "city": ["Lahore"] * 24,
+        "datetime": pd.to_datetime([now - timedelta(hours=i) for i in range(24)]).astype("datetime64[us]"),
+        "aqi_test": np.random.uniform(50.0, 150.0, size=24).astype(np.float64),
+    })
 
-for name, opts in strategies:
-    print("=" * 60)
-    print(name, opts)
-    print("=" * 60)
-    try:
-        fg.insert(df, write_options=opts)
-        print(f">>> SUCCESS with {name}\n")
-        break
-    except Exception as e:
-        print(f">>> FAILED: {type(e).__name__}: {e}\n")
-        time.sleep(5)
+    # Use a new name/version so schema conflicts cannot occur
+    test_fg = fs.get_or_create_feature_group(
+        name="github_actions_debug_fg",
+        version=1,
+        primary_key=["city"],
+        event_time="datetime",
+        description="Temporary test FG for CI/CD pipeline",
+        online_enabled=True
+    )
+
+    print("Inserting into github_actions_debug_fg...")
+    test_fg.insert(df, write_options={"wait_for_job": False})
+    print(">>> Test write succeeded!")
+
+if __name__ == "__main__":
+    test_isolated_upload()
