@@ -173,7 +173,7 @@ def fetch_forecast():
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_shap(horizon):
     try:
-        r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=60)
+        r = requests.get(f"{API_BASE}/api/shap/{horizon}", timeout=120)
         if r.status_code == 200:
             return r.json()
         return None
