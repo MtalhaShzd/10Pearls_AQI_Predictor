@@ -24,3 +24,4 @@ requests
 APScheduler
 ipykernel
 gunicorn
+flask-cors
