@@ -39,8 +39,8 @@ DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 LAT, LON = 31.5204, 74.3587
 CITY_TZ = "Asia/Karachi"          # Open-Meteo timezone=auto returns LOCAL naive times
 
-FG_NAME = "lahore_air_quality_features"
-FG_VERSION = 2                     # v2 = streaming-enabled
+FG_NAME = os.getenv("HOPSWORKS_FEATURE_GROUP", "lahore_air_quality_features")
+FG_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "2"))                   # v2 = streaming-enabled
 FG_PRIMARY_KEY = ["datetime"]
 FG_EVENT_TIME = "datetime"
 
