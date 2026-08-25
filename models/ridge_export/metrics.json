@@ -2,7 +2,7 @@
   "val_mae": 1.0002,
   "val_rmse": 1.5078,
   "val_r2": 0.9988,
-  "test_mae": 2.9047,
-  "test_rmse": 4.702,
-  "test_r2": 0.9867
+  "test_mae": 2.9125,
+  "test_rmse": 4.7199,
+  "test_r2": 0.9866
 }
