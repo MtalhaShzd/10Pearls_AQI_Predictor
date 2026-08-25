@@ -1,35 +1,54 @@
 """
-Daily Training Pipeline
-Retrains the Ridge Regression model on the latest
-data and updates the Hopsworks Model Registry.
+Daily Training Pipeline — Lahore AQI (Ridge, 1h ahead)
+======================================================
+Reads features from the Hopsworks Feature Store (v2, streaming), trains a
+scaled Ridge regressor, evaluates against a persistence baseline, and
+registers the model in the Hopsworks Model Registry.
+
+Usage:
+    python src/training_pipeline.py
+    python src/training_pipeline.py --only-if-better   # recommended for daily cron
+    python src/training_pipeline.py --source csv       # train from local CSV
+    python src/training_pipeline.py --no-upload
 """
 
-import os
-import sys
+import argparse
 import json
+import os
 import shutil
+import sys
+import traceback
 import warnings
 from datetime import datetime
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
-
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "lahore" / "lahore_features_hourly.csv"
 MODEL_DIR = PROJECT_ROOT / "models"
+RIDGE_EXPORT_DIR = MODEL_DIR / "ridge_export"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# Dedicated folder only for ridge artifacts to avoid uploading unrelated models (like XGBoost)
-RIDGE_EXPORT_DIR = MODEL_DIR / "ridge_export"
+FG_NAME = os.getenv("HOPSWORKS_FEATURE_GROUP", "lahore_air_quality_features")
+FG_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "2"))   # v2 = streaming
+MODEL_NAME = "lahore_aqi_ridge_1h"
+
+MIN_ROWS = 500
+RIDGE_ALPHA = 1.0
 
 FEATURE_COLUMNS = [
     "temperature_2m", "relative_humidity_2m", "surface_pressure",
@@ -39,174 +58,246 @@ FEATURE_COLUMNS = [
     "day_of_week", "is_weekend", "hour_sin", "hour_cos",
     "month_sin", "month_cos", "aqi_change_rate", "aqi_lag_1h",
     "aqi_lag_24h", "aqi_rolling_mean_6h", "aqi_rolling_std_6h",
-    "pm25_rolling_mean_6h"
+    "pm25_rolling_mean_6h",
 ]
 
 
-def load_and_prepare_data():
-    """Load CSV, create target, time-based split."""
-    print("📂 Loading dataset...")
-    df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
+def hopsworks_login():
+    """Login with explicit host/project — the bare login() defaults elsewhere."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
-    print(f"Total rows: {len(df)}")
-    print(f"Date range: {df['datetime'].min()} to {df['datetime'].max()}")
+    api_key = os.getenv("HOPSWORKS_API_KEY")
+    if not api_key:
+        return None
 
-    # Create target: AQI 1 hour ahead
-    df["target_aqi_1h"] = df["us_aqi"].shift(-1)
+    import hopsworks
+    return hopsworks.login(
+        host=os.getenv("HOPSWORKS_HOST", "eu-west.cloud.hopsworks.ai"),
+        project=os.getenv("HOPSWORKS_PROJECT", "internship10P"),
+        api_key_value=api_key,
+    )
 
-    initial_count = len(df)
-    df = df.dropna().reset_index(drop=True)
-    removed = initial_count - len(df)
-    if removed > 0:
-        print(f"Dropped {removed} rows with NaN values (recent hourly data without full lag history)")
 
-    # Time-based split (70% train, 15% val, 15% test)
+# --------------------------------------------------------------------------
+# DATA
+# --------------------------------------------------------------------------
+def load_dataframe(source: str) -> pd.DataFrame:
+    """Load features. Hopsworks is the source of truth; CSV is a fallback.
+
+    FIX: the old version trained from the CSV only. On ephemeral CI runners
+    that CSV is whatever git has committed, so the model could silently train
+    on stale data while the feature store moved on.
+    """
+    df = None
+
+    if source in ("auto", "hopsworks"):
+        project = hopsworks_login()
+        if project is None:
+            if source == "hopsworks":
+                raise RuntimeError("--source hopsworks but HOPSWORKS_API_KEY is not set")
+            print("ℹ️ No HOPSWORKS_API_KEY — falling back to local CSV")
+        else:
+            print(f"📥 Reading {FG_NAME} v{FG_VERSION} from feature store...")
+            fg = project.get_feature_store().get_feature_group(FG_NAME, version=FG_VERSION)
+            df = fg.read()
+            print(f"   {len(df)} rows retrieved")
+
+    if df is None:
+        if not DATA_PATH.exists():
+            raise FileNotFoundError(f"No feature store access and no CSV at {DATA_PATH}")
+        print(f"📂 Reading local CSV: {DATA_PATH}")
+        df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
+
+    # CRITICAL: offline-store reads come back UNORDERED.
+    # Without this sort, every lag/target computation below is garbage.
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+    df = (df.drop_duplicates(subset="datetime", keep="last")
+            .sort_values("datetime")
+            .reset_index(drop=True))
+
+    missing = set(FEATURE_COLUMNS + ["datetime"]) - set(df.columns)
+    if missing:
+        raise ValueError(f"Dataset missing required columns: {missing}")
+
+    span = int((df["datetime"].max() - df["datetime"].min()).total_seconds() // 3600) + 1
+    print(f"   Range   : {df['datetime'].min()} → {df['datetime'].max()}")
+    print(f"   Coverage: {len(df)}/{span} hours ({100 * len(df) / span:.1f}%)")
+    if len(df) < span * 0.95:
+        print(f"   ⚠️ {span - len(df)} hourly gaps — consider running the backfill pipeline")
+
+    return df
+
+
+def build_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Target = us_aqi one hour LATER, joined on the clock.
+
+    FIX: the old shift(-1) silently jumped across time gaps, pairing (say)
+    Jul-31 23:00 with Aug-25 00:00 and teaching the model nonsense.
+    """
+    nxt = df[["datetime", "us_aqi"]].rename(columns={"us_aqi": "target_aqi_1h"})
+    nxt["datetime"] = nxt["datetime"] - pd.Timedelta(hours=1)
+    out = df.merge(nxt, on="datetime", how="left")
+
+    before = len(out)
+    out = out.dropna(subset=FEATURE_COLUMNS + ["target_aqi_1h"]).reset_index(drop=True)
+    print(f"   Dropped {before - len(out)} rows (gap-adjacent or NaN)")
+    return out
+
+
+def time_split(df: pd.DataFrame):
     n = len(df)
-    train_end = int(n * 0.70)
-    val_end = int(n * 0.85)
+    if n < MIN_ROWS:
+        raise ValueError(f"Only {n} usable rows — need at least {MIN_ROWS}")
 
-    X = df[FEATURE_COLUMNS]
-    y = df["target_aqi_1h"]
+    train_end, val_end = int(n * 0.70), int(n * 0.85)
+    X, y = df[FEATURE_COLUMNS], df["target_aqi_1h"]
 
-    splits = {
-        "X_train": X.iloc[:train_end],
-        "y_train": y.iloc[:train_end],
-        "X_val":   X.iloc[train_end:val_end],
-        "y_val":   y.iloc[train_end:val_end],
-        "X_test":  X.iloc[val_end:],
-        "y_test":  y.iloc[val_end:],
+    s = {
+        "X_train": X.iloc[:train_end],       "y_train": y.iloc[:train_end],
+        "X_val":   X.iloc[train_end:val_end], "y_val":   y.iloc[train_end:val_end],
+        "X_test":  X.iloc[val_end:],          "y_test":  y.iloc[val_end:],
     }
-    print(f"Train: {len(splits['X_train'])} | Val: {len(splits['X_val'])} | Test: {len(splits['X_test'])}")
-    return splits
+    print(f"   Split → train {len(s['X_train'])} | val {len(s['X_val'])} | test {len(s['X_test'])}")
+    return s
 
 
-def train_and_evaluate(splits):
-    """Train Ridge Regression, evaluate on validation and test sets."""
-    print("\n🧠 Training Ridge Regression...")
-
-    model = Ridge(alpha=1.0, random_state=42)
-    model.fit(splits["X_train"], splits["y_train"])
-
-    # Validation metrics
-    val_pred = model.predict(splits["X_val"])
-    val_mae = mean_absolute_error(splits["y_val"], val_pred)
-    val_rmse = np.sqrt(mean_squared_error(splits["y_val"], val_pred))
-    val_r2 = r2_score(splits["y_val"], val_pred)
-
-    # Test metrics
-    test_pred = model.predict(splits["X_test"])
-    test_mae = mean_absolute_error(splits["y_test"], test_pred)
-    test_rmse = np.sqrt(mean_squared_error(splits["y_test"], test_pred))
-    test_r2 = r2_score(splits["y_test"], test_pred)
-
-    metrics = {
-        "val_mae":   round(float(val_mae), 4),
-        "val_rmse":  round(float(val_rmse), 4),
-        "val_r2":    round(float(val_r2), 4),
-        "test_mae":  round(float(test_mae), 4),
-        "test_rmse": round(float(test_rmse), 4),
-        "test_r2":   round(float(test_r2), 4),
+# --------------------------------------------------------------------------
+# TRAIN
+# --------------------------------------------------------------------------
+def evaluate(y_true, y_pred, prefix):
+    return {
+        f"{prefix}_mae":  round(float(mean_absolute_error(y_true, y_pred)), 4),
+        f"{prefix}_rmse": round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 4),
+        f"{prefix}_r2":   round(float(r2_score(y_true, y_pred)), 4),
     }
 
-    print(f"Validation: MAE={val_mae:.4f} | RMSE={val_rmse:.4f} | R²={val_r2:.4f}")
-    print(f"Test      : MAE={test_mae:.4f} | RMSE={test_rmse:.4f} | R²={test_r2:.4f}")
+
+def train_and_evaluate(s):
+    """Train scaled Ridge.
+
+    FIX: raw Ridge on unscaled features penalised surface_pressure (~1000) and
+    hour_sin (~1) with the same alpha, effectively ignoring the small-scale
+    features. StandardScaler inside a Pipeline fixes this and keeps
+    joblib.load(...).predict(X) working exactly as before.
+    """
+    print("\n🧠 Training Ridge (StandardScaler + Ridge)...")
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("ridge", Ridge(alpha=RIDGE_ALPHA)),
+    ])
+    model.fit(s["X_train"], s["y_train"])
+
+    metrics = {}
+    metrics.update(evaluate(s["y_val"],  model.predict(s["X_val"]),  "val"))
+    metrics.update(evaluate(s["y_test"], model.predict(s["X_test"]), "test"))
+
+    # Persistence baseline: "next hour = this hour". If we can't beat it, stop.
+    base = evaluate(s["y_test"], s["X_test"]["us_aqi"].values, "baseline")
+    metrics.update(base)
+
+    print(f"   Val      : MAE={metrics['val_mae']:<8} RMSE={metrics['val_rmse']:<8} R²={metrics['val_r2']}")
+    print(f"   Test     : MAE={metrics['test_mae']:<8} RMSE={metrics['test_rmse']:<8} R²={metrics['test_r2']}")
+    print(f"   Baseline : MAE={base['baseline_mae']:<8} RMSE={base['baseline_rmse']:<8} R²={base['baseline_r2']}")
+
+    if metrics["test_rmse"] < base["baseline_rmse"]:
+        gain = 100 * (1 - metrics["test_rmse"] / base["baseline_rmse"])
+        print(f"   ✅ Beats persistence baseline by {gain:.1f}%")
+    else:
+        print("   ⚠️ Model does NOT beat the naive persistence baseline")
+
     return model, metrics
 
 
 def save_model_locally(model, metrics):
-    """Save model, metrics, and feature list locally."""
-    print("\n💾 Saving model locally...")
-
-    # 1. Save standard local artifacts in models/
+    print("\n💾 Saving artifacts...")
     joblib.dump(model, MODEL_DIR / "ridge_aqi_1h.pkl")
-    with open(MODEL_DIR / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    with open(MODEL_DIR / "feature_columns.json", "w") as f:
-        json.dump(FEATURE_COLUMNS, f, indent=2)
+    (MODEL_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    (MODEL_DIR / "feature_columns.json").write_text(json.dumps(FEATURE_COLUMNS, indent=2))
 
-    # 2. Prepare clean, isolated directory for Hopsworks upload
     if RIDGE_EXPORT_DIR.exists():
         shutil.rmtree(RIDGE_EXPORT_DIR)
     RIDGE_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     joblib.dump(model, RIDGE_EXPORT_DIR / "ridge_aqi_1h.pkl")
-    with open(RIDGE_EXPORT_DIR / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    with open(RIDGE_EXPORT_DIR / "feature_columns.json", "w") as f:
-        json.dump(FEATURE_COLUMNS, f, indent=2)
-
-    print(f"✅ Saved clean artifacts to: {RIDGE_EXPORT_DIR}")
+    (RIDGE_EXPORT_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    (RIDGE_EXPORT_DIR / "feature_columns.json").write_text(json.dumps(FEATURE_COLUMNS, indent=2))
+    print(f"   ✅ {RIDGE_EXPORT_DIR}")
 
 
-def upload_to_hopsworks(model, metrics):
-    """Upload only the Ridge model directory to Hopsworks Model Registry."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv("HOPSWORKS_API_KEY")
-
-        if not api_key:
-            print("ℹ️ No HOPSWORKS_API_KEY, skipping cloud upload")
-            return
-
-        print("\n📤 Uploading to Hopsworks Model Registry...")
-        import hopsworks
-        project = hopsworks.login(api_key_value=api_key)
-        mr = project.get_model_registry()
-
-        input_example = pd.DataFrame([{
-            "temperature_2m": 25.0, "relative_humidity_2m": 60.0,
-            "surface_pressure": 1013.0, "precipitation": 0.0,
-            "cloud_cover": 30.0, "wind_speed_10m": 5.0,
-            "wind_direction_10m": 180.0, "pm2_5": 80.0,
-            "pm10": 120.0, "carbon_monoxide": 700.0,
-            "nitrogen_dioxide": 40.0, "sulphur_dioxide": 10.0,
-            "ozone": 55.0, "us_aqi": 160.0,
-            "hour": 10, "day": 15, "month": 6,
-            "day_of_week": 2, "is_weekend": 0,
-            "hour_sin": 0.5, "hour_cos": 0.866,
-            "month_sin": 0.5, "month_cos": 0.866,
-            "aqi_change_rate": -0.5, "aqi_lag_1h": 161.0,
-            "aqi_lag_24h": 155.0, "aqi_rolling_mean_6h": 158.0,
-            "aqi_rolling_std_6h": 3.0, "pm25_rolling_mean_6h": 78.0
-        }])
-
-        # Let Hopsworks auto-increment the version
-        model_entry = mr.sklearn.create_model(
-            name="lahore_aqi_ridge_1h",
-            metrics=metrics,
-            description=(
-                f"Daily retrained Ridge Regression. "
-                f"Test RMSE: {metrics['test_rmse']} | "
-                f"Test R²: {metrics['test_r2']}"
-            ),
-            input_example=input_example
-        )
-
-        # Upload ONLY the isolated folder with 3 small files (< 50 KB)
-        model_entry.save(str(RIDGE_EXPORT_DIR))
-        print("✅ Model successfully uploaded to Hopsworks!")
-
-    except Exception as e:
-        print(f"⚠️ Hopsworks upload failed: {e}")
+# --------------------------------------------------------------------------
+# REGISTRY
+# --------------------------------------------------------------------------
+def build_input_example(X_train: pd.DataFrame) -> pd.DataFrame:
+    """Derive the example from real data instead of hardcoding 29 numbers."""
+    return X_train.tail(1).reset_index(drop=True)
 
 
-def run_daily_pipeline():
-    """Main daily training execution."""
+def upload_to_hopsworks(metrics, input_example, only_if_better=False) -> bool:
+    """Register the model. Raises on failure — never silently skips."""
+    project = hopsworks_login()
+    if project is None:
+        print("ℹ️ No HOPSWORKS_API_KEY — skipping model registry upload")
+        return True
+
+    print("\n📤 Uploading to Hopsworks Model Registry...")
+    mr = project.get_model_registry()
+
+    if only_if_better:
+        best = None
+        try:
+            for m in mr.get_models(MODEL_NAME):
+                r = (m.training_metrics or {}).get("test_rmse")
+                if r is not None:
+                    r = float(r)
+                    if best is None or r < best:
+                        best = r
+        except Exception as e:
+            print(f"   ⚠️ Could not read existing models ({e}) — registering anyway")
+
+        if best is not None:
+            print(f"   Best registered test_rmse: {best} | new: {metrics['test_rmse']}")
+            if metrics["test_rmse"] >= best:
+                print("   ⏭️ Not an improvement — skipping registration (no version bump)")
+                return True
+
+    entry = mr.sklearn.create_model(
+        name=MODEL_NAME,
+        metrics=metrics,
+        description=(
+            f"Daily retrained Ridge (scaled). "
+            f"Test RMSE {metrics['test_rmse']} | R² {metrics['test_r2']} | "
+            f"baseline RMSE {metrics['baseline_rmse']}"
+        ),
+        input_example=input_example,
+    )
+    entry.save(str(RIDGE_EXPORT_DIR))
+    print(f"   ✅ Registered {MODEL_NAME} v{entry.version}")
+    return True
+
+
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+def run_daily_pipeline(source="auto", upload=True, only_if_better=False) -> bool:
     print("=" * 60)
     print("📅 DAILY TRAINING PIPELINE STARTED")
-    print(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Run time: {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC")
     print("=" * 60)
 
-    if not DATA_PATH.exists():
-        print(f"❌ Data not found at {DATA_PATH}")
-        return False
-
-    splits = load_and_prepare_data()
+    df = load_dataframe(source)
+    df = build_target(df)
+    splits = time_split(df)
     model, metrics = train_and_evaluate(splits)
     save_model_locally(model, metrics)
-    upload_to_hopsworks(model, metrics)
+
+    if upload:
+        upload_to_hopsworks(metrics, build_input_example(splits["X_train"]), only_if_better)
+    else:
+        print("\nℹ️ --no-upload set, skipping registry")
 
     print("=" * 60)
     print("✅ DAILY TRAINING COMPLETE")
@@ -214,6 +305,22 @@ def run_daily_pipeline():
     return True
 
 
+def main():
+    p = argparse.ArgumentParser(description="Lahore AQI daily training pipeline")
+    p.add_argument("--source", choices=["auto", "hopsworks", "csv"], default="auto")
+    p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--only-if-better", action="store_true",
+                   help="Only register if test_rmse improves on the best existing version")
+    a = p.parse_args()
+
+    try:
+        ok = run_daily_pipeline(a.source, not a.no_upload, a.only_if_better)
+    except Exception:
+        print("\n❌ TRAINING PIPELINE FAILED")
+        traceback.print_exc()
+        sys.exit(1)          
+    sys.exit(0 if ok else 1)
+
+
 if __name__ == "__main__":
-    success = run_daily_pipeline()
-    sys.exit(0 if success else 1)
+    main()
