@@ -2,21 +2,38 @@ name: Hourly Feature Pipeline
 
 on:
   schedule:
-    # Runs every hour at minute 0
-    - cron: "0 * * * *"
-  workflow_dispatch:  # Allows manual trigger from GitHub UI
-  push:
-    branches: [main]
+    - cron: "15 * * * *"      # :15 gives Open-Meteo time to publish the hour
+  workflow_dispatch:
+    inputs:
+      past_days:
+        description: "Days of history to fetch (1-92). Use ~30 to close a gap."
+        required: false
+        default: "3"
+
+permissions:
+  contents: write             
+
+concurrency:
+  group: aqi-data-write       
+  cancel-in-progress: false
 
 jobs:
   run-hourly-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+      HOPSWORKS_HOST: eu-west.cloud.hopsworks.ai
+      HOPSWORKS_PROJECT: internship10P
+      HOPSWORKS_FEATURE_GROUP: lahore_air_quality_features
+      HOPSWORKS_FEATURE_GROUP_VERSION: "2"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0      
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,42 +44,33 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-ci.txt       
 
-      - name: Create .env file
-        run: |
-          echo "HOPSWORKS_API_KEY=${{ secrets.HOPSWORKS_API_KEY }}" >> .env
-          echo "HOPSWORKS_PROJECT=internship10P" >> .env
+      - name: Verify streaming dependencies
+        run: python -c "import confluent_kafka, fastavro; print('kafka deps OK')"
 
       - name: Run hourly feature pipeline
-        env:
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-        run: python scripts/feature_pipeline.py
-
-      - name: Check for CSV changes
-        id: check_changes
         run: |
-          if [ -f data/processed/lahore/lahore_features_hourly.csv ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "CSV exists, will commit if changed"
-          else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No CSV found, skipping commit"
-          fi
+          python scripts/feature_pipeline.py \
+            --past-days "${{ inputs.past_days || '3' }}"
 
-      - name: Commit updated data
+      - name: Commit updated CSV
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # Stage the updated hourly data
           git add data/processed/lahore/lahore_features_hourly.csv
-          
-          # If data changed: commit, rebase-pull remote commits, and push
-          if ! git diff --staged --quiet; then
-            git commit -m "chore: hourly data update $(date -u +'%Y-%m-%d %H:%M:%S UTC') [skip ci]"
-            git pull --rebase --autostash origin main
-            git push origin main
-          else
+
+          if git diff --staged --quiet; then
             echo "No data changes to commit."
+            exit 0
           fi
+
+          git commit -m "chore: hourly data update $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
+
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main && git push origin main && exit 0
+            echo "Push attempt $i failed, retrying..."
+            sleep $((5 * i))
+          done
+          echo "::error::Failed to push after 3 attempts"
+          exit 1
