@@ -1,15 +1,25 @@
 """
-Hourly Feature Pipeline
-Fetches the current hour's data and appends
-engineered features to lahore_features_hourly.csv
+Hourly Feature Pipeline — Lahore AQI
+====================================
+Fetches recent weather + pollutant data, engineers features, appends to
+lahore_features_hourly.csv, and upserts into the Hopsworks Feature Store
+(lahore_air_quality_features v2, streaming).
+
+Usage:
+    python src/feature_pipeline.py                  # normal hourly run
+    python src/feature_pipeline.py --past-days 30   # close a data gap
+    python src/feature_pipeline.py --no-upload      # local CSV only
 """
 
-import os
-import sys
+import argparse
 import json
-import warnings
+import os
+import sys 
+import time
+import traceback
 import urllib.request
-from datetime import datetime, timedelta
+import warnings
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -17,113 +27,160 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# Make sure Python can find project modules
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "lahore" / "lahore_features_hourly.csv"
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Lahore coordinates
-LAT = 31.5204
-LON = 74.3587
+LAT, LON = 31.5204, 74.3587
+CITY_TZ = "Asia/Karachi"          # Open-Meteo timezone=auto returns LOCAL naive times
+
+FG_NAME = "lahore_air_quality_features"
+FG_VERSION = 2                     # v2 = streaming-enabled
+FG_PRIMARY_KEY = ["datetime"]
+FG_EVENT_TIME = "datetime"
+
+DEFAULT_PAST_DAYS = 3              # forecast API supports up to 92
+OVERLAP_HOURS = 24                 # re-upload recent rows so lags self-correct
+
+INT_COLS = ["hour", "day", "month", "day_of_week", "is_weekend"]
+
+FEATURE_COLUMNS = [
+    "datetime", "temperature_2m", "relative_humidity_2m", "surface_pressure",
+    "precipitation", "cloud_cover", "wind_speed_10m", "wind_direction_10m",
+    "pm2_5", "pm10", "carbon_monoxide", "nitrogen_dioxide", "sulphur_dioxide",
+    "ozone", "us_aqi", "hour", "day", "month", "day_of_week", "is_weekend",
+    "hour_sin", "hour_cos", "month_sin", "month_cos", "aqi_change_rate",
+    "aqi_lag_1h", "aqi_lag_24h", "aqi_rolling_mean_6h", "aqi_rolling_std_6h",
+    "pm25_rolling_mean_6h",
+]
 
 
-def fetch_current_weather():
-    """Fetch current and past 48h weather for feature engineering."""
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
+def now_local() -> pd.Timestamp:
+    """Current Lahore wall-clock time as a NAIVE timestamp.
 
-    url = (
-        f"https://archive-api.open-meteo.com/v1/archive?"
-        f"latitude={LAT}&longitude={LON}"
-        f"&start_date={start_date}&end_date={end_date}"
-        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,"
-        f"precipitation,cloud_cover,wind_speed_10m,wind_direction_10m"
-        f"&timezone=auto"
-    )
+    FIX: previously used pd.Timestamp.now() which is UTC on CI runners.
+    Lahore is UTC+5, so the newest 5 hours were silently discarded.
+    """
+    return pd.Timestamp.now(tz=CITY_TZ).tz_localize(None)
 
-    with urllib.request.urlopen(url) as response:
-        data = json.loads(response.read().decode())
 
-    hourly = data["hourly"]
+def http_get_json(url: str, retries: int = 3, timeout: int = 30) -> dict:
+    """GET JSON with retries and exponential backoff."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            last_err = e
+            print(f"   ⚠️ attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Request failed after {retries} attempts:\n{url}\n{last_err}")
+
+
+def fg_column_names(fg) -> list:
+    """Read FG schema, tolerating the .features -> .columns deprecation."""
+    cols = getattr(fg, "columns", None)
+    if cols:
+        return [c if isinstance(c, str) else c.name for c in cols]
+    return [f.name for f in fg.features]
+
+
+# --------------------------------------------------------------------------
+# DATA FETCHING
+# --------------------------------------------------------------------------
+WEATHER_VARS = (
+    "temperature_2m,relative_humidity_2m,surface_pressure,precipitation,"
+    "cloud_cover,wind_speed_10m,wind_direction_10m"
+)
+POLLUTANT_VARS = (
+    "pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,us_aqi"
+)
+
+
+def fetch_weather(past_days=DEFAULT_PAST_DAYS, start_date=None, end_date=None) -> pd.DataFrame:
+    """Fetch hourly weather.
+
+    FIX: the old code used archive-api (ERA5), which lags ~5 days behind and
+    returns nulls for recent hours -> dropna() wiped everything -> "no new data".
+    We now use the forecast endpoint with past_days for recent data, and only
+    fall back to the archive for explicit historical date ranges.
+    """
+    if start_date and end_date:
+        url = (
+            f"https://archive-api.open-meteo.com/v1/archive?"
+            f"latitude={LAT}&longitude={LON}"
+            f"&start_date={start_date}&end_date={end_date}"
+            f"&hourly={WEATHER_VARS}&timezone=auto"
+        )
+    else:
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={LAT}&longitude={LON}"
+            f"&hourly={WEATHER_VARS}"
+            f"&past_days={past_days}&forecast_days=1&timezone=auto"
+        )
+
+    h = http_get_json(url)["hourly"]
     df = pd.DataFrame({
-        "datetime": pd.to_datetime(hourly["time"]),
-        "temperature_2m": hourly["temperature_2m"],
-        "relative_humidity_2m": hourly["relative_humidity_2m"],
-        "surface_pressure": hourly["surface_pressure"],
-        "precipitation": hourly["precipitation"],
-        "cloud_cover": hourly["cloud_cover"],
-        "wind_speed_10m": hourly["wind_speed_10m"],
-        "wind_direction_10m": hourly["wind_direction_10m"],
+        "datetime": pd.to_datetime(h["time"]),
+        "temperature_2m": h["temperature_2m"],
+        "relative_humidity_2m": h["relative_humidity_2m"],
+        "surface_pressure": h["surface_pressure"],
+        "precipitation": h["precipitation"],
+        "cloud_cover": h["cloud_cover"],
+        "wind_speed_10m": h["wind_speed_10m"],
+        "wind_direction_10m": h["wind_direction_10m"],
     })
-
-    # Filter out any future timestamps
-    now = pd.Timestamp.now(tz=df["datetime"].dt.tz)
-    df = df[df["datetime"] <= now]
-    df = df.dropna()
-    return df
+    df = df[df["datetime"] <= now_local()].dropna()
+    return df.reset_index(drop=True)
 
 
-def fetch_current_pollutants():
+def fetch_pollutants(past_days=DEFAULT_PAST_DAYS, start_date=None, end_date=None) -> pd.DataFrame:
+    """Fetch hourly pollutants.
+
+    FIX: removed the old fallback that duplicated the last CSV row — that
+    fabricated fake data. Now it raises so the failure is visible.
     """
-    Fetch current pollutant levels.
-    Uses Open-Meteo Air Quality API (free, no key required).
-    """
+    base = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={LAT}&longitude={LON}&hourly={POLLUTANT_VARS}&timezone=auto"
     url = (
-        f"https://air-quality-api.open-meteo.com/v1/air-quality?"
-        f"latitude={LAT}&longitude={LON}"
-        f"&hourly=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,"
-        f"sulphur_dioxide,ozone,us_aqi"
-        f"&timezone=auto&past_days=2"
+        f"{base}&start_date={start_date}&end_date={end_date}"
+        if start_date and end_date else f"{base}&past_days={past_days}"
     )
 
-    try:
-        with urllib.request.urlopen(url) as response:
-            data = json.loads(response.read().decode())
-
-        hourly = data["hourly"]
-        df = pd.DataFrame({
-            "datetime": pd.to_datetime(hourly["time"]),
-            "pm2_5": hourly["pm2_5"],
-            "pm10": hourly["pm10"],
-            "carbon_monoxide": hourly["carbon_monoxide"],
-            "nitrogen_dioxide": hourly["nitrogen_dioxide"],
-            "sulphur_dioxide": hourly["sulphur_dioxide"],
-            "ozone": hourly["ozone"],
-            "us_aqi": hourly["us_aqi"],
-        })
-
-        # Filter out any future timestamps
-        now = pd.Timestamp.now(tz=df["datetime"].dt.tz)
-        df = df[df["datetime"] <= now]
-        df = df.dropna()
-        return df
-
-    except Exception as e:
-        print(f"⚠️ Using fallback pollutant estimation: {e}")
-        if DATA_PATH.exists():
-            last = pd.read_csv(DATA_PATH, parse_dates=["datetime"]).iloc[-1]
-            return pd.DataFrame([{
-                "datetime": last["datetime"],
-                "pm2_5": last["pm2_5"],
-                "pm10": last["pm10"],
-                "carbon_monoxide": last["carbon_monoxide"],
-                "nitrogen_dioxide": last["nitrogen_dioxide"],
-                "sulphur_dioxide": last["sulphur_dioxide"],
-                "ozone": last["ozone"],
-                "us_aqi": last["us_aqi"],
-            }])
-        return None
+    h = http_get_json(url)["hourly"]
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(h["time"]),
+        "pm2_5": h["pm2_5"],
+        "pm10": h["pm10"],
+        "carbon_monoxide": h["carbon_monoxide"],
+        "nitrogen_dioxide": h["nitrogen_dioxide"],
+        "sulphur_dioxide": h["sulphur_dioxide"],
+        "ozone": h["ozone"],
+        "us_aqi": h["us_aqi"],
+    })
+    df = df[df["datetime"] <= now_local()].dropna()
+    return df.reset_index(drop=True)
 
 
-def add_time_features(df):
-    """Add cyclical and time-based features."""
+# --------------------------------------------------------------------------
+# FEATURE ENGINEERING
+# --------------------------------------------------------------------------
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df["hour"] = df["datetime"].dt.hour
     df["day"] = df["datetime"].dt.day
     df["month"] = df["datetime"].dt.month
     df["day_of_week"] = df["datetime"].dt.dayofweek
-    df["is_weekend"] = df["day_of_week"].apply(lambda x: 1 if x >= 5 else 0)
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
     df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12.0)
@@ -131,144 +188,209 @@ def add_time_features(df):
     return df
 
 
-def add_lag_and_rolling_features(df):
-    """Add lag and rolling features to the most recent rows."""
+def add_lag_and_rolling_features(df: pd.DataFrame, recompute_tail: int = 48) -> pd.DataFrame:
+    """Vectorised lag/rolling features.
+
+    FIX: the old row-by-row loop with df.at[] was O(n) Python and error-prone.
+    Same semantics, ~1000x faster. Only the last `recompute_tail` rows are
+    overwritten so previously-computed history stays byte-identical.
+    """
     df = df.sort_values("datetime").reset_index(drop=True)
+    aqi, pm25 = df["us_aqi"], df["pm2_5"]
 
-    # Only compute for the last 24 rows (most recent data)
-    for i in range(max(0, len(df) - 24), len(df)):
-        idx = i
+    lag_1, lag_2, lag_24 = aqi.shift(1), aqi.shift(2), aqi.shift(24)
 
-        # AQI change rate
-        if idx >= 2:
-            lag_1h = df.iloc[idx - 1]["us_aqi"]
-            lag_2h = df.iloc[idx - 2]["us_aqi"]
-            df.at[idx, "aqi_change_rate"] = (lag_1h - lag_2h) / (lag_2h + 1e-5)
-        else:
-            df.at[idx, "aqi_change_rate"] = 0.0
+    computed = pd.DataFrame({
+        "aqi_change_rate": ((lag_1 - lag_2) / (lag_2 + 1e-5)).replace([np.inf, -np.inf], 0.0).fillna(0.0),
+        "aqi_lag_1h": lag_1.fillna(aqi),
+        "aqi_lag_24h": lag_24.fillna(aqi),
+        "aqi_rolling_mean_6h": aqi.rolling(6, min_periods=1).mean(),
+        "aqi_rolling_std_6h": aqi.rolling(6, min_periods=1).std().fillna(0.0),
+        "pm25_rolling_mean_6h": pm25.rolling(6, min_periods=1).mean(),
+    }, index=df.index)
 
-        # AQI lag 1h
-        if idx >= 1:
-            df.at[idx, "aqi_lag_1h"] = df.iloc[idx - 1]["us_aqi"]
-        else:
-            df.at[idx, "aqi_lag_1h"] = df.iloc[idx]["us_aqi"]
+    for col in computed.columns:
+        if col not in df.columns:
+            df[col] = np.nan
 
-        # AQI lag 24h
-        if idx >= 24:
-            df.at[idx, "aqi_lag_24h"] = df.iloc[idx - 24]["us_aqi"]
-        else:
-            df.at[idx, "aqi_lag_24h"] = df.iloc[idx]["us_aqi"]
-
-        # Rolling 6h
-        if idx >= 5:
-            window = df.iloc[idx - 5:idx + 1]["us_aqi"]
-            df.at[idx, "aqi_rolling_mean_6h"] = window.mean()
-            df.at[idx, "aqi_rolling_std_6h"] = window.std() if len(window) > 1 else 0.0
-            df.at[idx, "pm25_rolling_mean_6h"] = df.iloc[idx - 5:idx + 1]["pm2_5"].mean()
-        else:
-            df.at[idx, "aqi_rolling_mean_6h"] = df.iloc[idx]["us_aqi"]
-            df.at[idx, "aqi_rolling_std_6h"] = 0.0
-            df.at[idx, "pm25_rolling_mean_6h"] = df.iloc[idx]["pm2_5"]
+    if recompute_tail and len(df) > recompute_tail:
+        tail = df.index[-recompute_tail:]
+        df.loc[tail, computed.columns] = computed.loc[tail]
+    else:
+        df[computed.columns] = computed
 
     return df
 
 
-def run_hourly_pipeline():
-    """Main hourly execution function."""
-    print("=" * 60)
-    print("⏰ HOURLY FEATURE PIPELINE STARTED")
-    print(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+# --------------------------------------------------------------------------
+# HOPSWORKS UPLOAD
+# --------------------------------------------------------------------------
+def upload_to_hopsworks(combined_df: pd.DataFrame) -> bool:
+    """Upsert recent rows into the streaming feature group."""
 
-    # 1. Load existing data
-    if DATA_PATH.exists():
-        existing_df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
-        print(f"Existing data: {len(existing_df)} rows")
-
-        # CLEANUP: Remove any future timestamps from previous runs
-        original_count = len(existing_df)
-        existing_df = existing_df[
-            existing_df["datetime"] <= pd.Timestamp.now(tz=existing_df["datetime"].dt.tz)
-        ]
-        removed = original_count - len(existing_df)
-        if removed > 0:
-            print(f"🧹 Cleaned {removed} future rows from previous runs")
-            existing_df.to_csv(DATA_PATH, index=False)
-    else:
-        existing_df = pd.DataFrame()
-        print("No existing data found, starting fresh")
-
-    # 2. Fetch latest weather
-    print("\n📡 Fetching current weather data...")
-    weather_df = fetch_current_weather()
-    print(f"Fetched {len(weather_df)} weather rows")
-
-    # 3. Fetch latest pollutants
-    print("📡 Fetching current pollutant data...")
-    pollutants_df = fetch_current_pollutants()
-    if pollutants_df is None:
-        print("❌ Failed to fetch pollutants. Aborting.")
-        return False
-    print(f"Fetched {len(pollutants_df)} pollutant rows")
-
-    # 4. Merge weather + pollutants
-    merged_df = pd.merge(weather_df, pollutants_df, on="datetime", how="inner")
-    merged_df = merged_df.dropna()
-    print(f"Merged dataset: {len(merged_df)} rows")
-
-    # 5. Combine with historical
-    combined_df = pd.concat([existing_df, merged_df], ignore_index=True)
-    combined_df = combined_df.drop_duplicates(subset="datetime", keep="last")
-    combined_df = combined_df.sort_values("datetime").reset_index(drop=True)
-
-    # 6. Apply feature engineering
-    print("🔧 Engineering features...")
-    combined_df = add_time_features(combined_df)
-    combined_df = add_lag_and_rolling_features(combined_df)
-
-    # 7. Get only the truly new rows
-    last_existing = pd.to_datetime(existing_df["datetime"]).max() if not existing_df.empty else pd.Timestamp.min
-    new_rows = combined_df[combined_df["datetime"] > last_existing]
-
-    if len(new_rows) == 0:
-        print("ℹ️ No new data to add")
-        return True
-
-    print(f"New rows to add: {len(new_rows)}")
-    print(f"Latest timestamp: {new_rows['datetime'].max()}")
-
-    # 8. Save back to CSV
-    combined_df.to_csv(DATA_PATH, index=False)
-    print(f"✅ Saved to: {DATA_PATH}")
-    print(f"Total rows now: {len(combined_df)}")
-
-    # 9. Upload to Hopsworks (if API key is available)
     try:
         from dotenv import load_dotenv
         load_dotenv()
-        api_key = os.getenv("HOPSWORKS_API_KEY")
+    except ImportError:
+        pass
 
-        if api_key:
-            print("\n📤 Uploading to Hopsworks Feature Store...")
-            import hopsworks
-            project = hopsworks.login(api_key_value=api_key)
-            fs = project.get_feature_store()
-            fg = fs.get_feature_group("lahore_air_quality_features", version=1)
+    api_key = os.getenv("HOPSWORKS_API_KEY")
+    if not api_key:
+        print("ℹ️ No HOPSWORKS_API_KEY set — skipping cloud upload (local CSV only)")
+        return True
 
-            new_data = combined_df.tail(len(new_rows) + 24).copy()
+    print("\n📤 Uploading to Hopsworks Feature Store...")
+    import hopsworks
 
-            # FIX: Ensure integer columns match Hopsworks schema ('bigint' = int64)
-            int_cols = ["hour", "day", "month", "day_of_week", "is_weekend"]
-            for col in int_cols:
-                if col in new_data.columns:
-                    new_data[col] = new_data[col].astype("int64")
+    project = hopsworks.login(
+        host=os.getenv("HOPSWORKS_HOST", "eu-west.cloud.hopsworks.ai"),
+        project=os.getenv("HOPSWORKS_PROJECT", "internship10P"),
+        api_key_value=api_key,
+    )
+    fs = project.get_feature_store()
 
-            fg.insert(new_data, wait=True)
-            print("✅ Hopsworks upload complete")
-        else:
-            print("ℹ️ No HOPSWORKS_API_KEY, skipping cloud upload (local only)")
+    # stream=True routes data via Kafka instead of direct HDFS RPC,
+    # which is blocked for external clients on Hopsworks Serverless.
+    fg = fs.get_or_create_feature_group(
+        name=FG_NAME,
+        version=FG_VERSION,
+        primary_key=FG_PRIMARY_KEY,
+        event_time=FG_EVENT_TIME,
+        description="Lahore AQI hourly features — streaming ingestion",
+        online_enabled=True,
+        stream=True,
+    )
+    # get_or_create silently IGNORES stream=True if the FG already exists.
+    # Fail loudly rather than crashing later with 'RPC listener disconnected'.
+    
+    if getattr(fg, "stream", False) is not True:
+        raise RuntimeError(
+            f"{FG_NAME} v{FG_VERSION} has stream=False. External writes will fail. "
+            f"Set HOPSWORKS_FEATURE_GROUP_VERSION to a streaming-enabled version."
+        )
+        
+    # Hopsworks is the source of truth, NOT the local CSV.
+    # CI runners are ephemeral, so the CSV watermark cannot be trusted.
+    try:
+        existing = fg.read()
+        watermark = pd.to_datetime(existing["datetime"]).max() if len(existing) else pd.Timestamp.min
+        print(f"   Feature store currently holds {len(existing)} rows up to {watermark}")
     except Exception as e:
-        print(f"⚠️ Hopsworks upload skipped: {e}")
+        print(f"   ⚠️ Could not read feature group ({e}) — uploading recent window anyway")
+        watermark = pd.Timestamp.min
+
+    cutoff = (watermark - pd.Timedelta(hours=OVERLAP_HOURS)
+              if watermark != pd.Timestamp.min else pd.Timestamp.min)
+    upload_df = combined_df[combined_df["datetime"] > cutoff].copy()
+
+    if upload_df.empty:
+        print("ℹ️ Feature store already up to date — nothing to upload")
+        return True
+
+    # --- dtype hygiene ---
+    upload_df["datetime"] = (
+        pd.to_datetime(upload_df["datetime"])
+          .dt.tz_localize(None)
+          .astype("datetime64[us]")          # avoids ns->us precision warning
+    )
+    for col in INT_COLS:
+        upload_df[col] = upload_df[col].fillna(0).astype("int64")   # schema says bigint
+
+    # --- align to live FG schema ---
+    schema = fg_column_names(fg)
+    missing = set(schema) - set(upload_df.columns)
+    if missing:
+        raise ValueError(f"DataFrame missing columns required by feature group: {missing}")
+    upload_df = upload_df[schema]
+
+    n_new = (upload_df["datetime"] > watermark).sum()
+    print(f"   Sending {len(upload_df)} rows ({n_new} new, "
+          f"{len(upload_df) - n_new} re-sent to refresh lag features)")
+
+    # datetime is the primary key, so overlapping rows upsert rather than duplicate.
+    fg.insert(upload_df, write_options={"wait_for_job": False})
+
+    print(f"✅ Upload complete — latest timestamp sent: {upload_df['datetime'].max()}")
+    return True
+
+
+# --------------------------------------------------------------------------
+# MAIN PIPELINE
+# --------------------------------------------------------------------------
+def run_hourly_pipeline(past_days=DEFAULT_PAST_DAYS, upload=True) -> bool:
+    print("=" * 60)
+    print("⏰ HOURLY FEATURE PIPELINE STARTED")
+    print(f"Run time (UTC)   : {datetime.utcnow():%Y-%m-%d %H:%M:%S}")
+    print(f"Run time (Lahore): {now_local():%Y-%m-%d %H:%M:%S}")
+    print(f"Fetch window     : last {past_days} day(s)")
+    print("=" * 60)
+
+    # 1. Load existing CSV
+    if DATA_PATH.exists():
+        existing_df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
+        print(f"Existing CSV rows: {len(existing_df)}")
+        before = len(existing_df)
+        existing_df = existing_df[existing_df["datetime"] <= now_local()]
+        if before - len(existing_df):
+            print(f" Removed {before - len(existing_df)} future-dated rows")
+    else:
+        existing_df = pd.DataFrame()
+        print("No existing CSV — starting fresh")
+
+    # 2 & 3. Fetch
+    print("\n📡 Fetching weather...")
+    weather_df = fetch_weather(past_days=past_days)
+    print(f"   {len(weather_df)} weather rows"
+          + (f" ({weather_df['datetime'].min()} → {weather_df['datetime'].max()})" if len(weather_df) else ""))
+
+    print("📡 Fetching pollutants...")
+    pollutants_df = fetch_pollutants(past_days=past_days)
+    print(f"   {len(pollutants_df)} pollutant rows"
+          + (f" ({pollutants_df['datetime'].min()} → {pollutants_df['datetime'].max()})" if len(pollutants_df) else ""))
+
+    if weather_df.empty or pollutants_df.empty:
+        print("❌ One or both APIs returned no usable rows. Aborting.")
+        return False
+
+    # 4. Merge
+    merged_df = pd.merge(weather_df, pollutants_df, on="datetime", how="inner").dropna()
+    print(f"🔗 Merged: {len(merged_df)} rows")
+    if merged_df.empty:
+        print("❌ Merge produced 0 rows (no overlapping timestamps). Aborting.")
+        return False
+
+    # 5. Combine with history
+    combined_df = (
+        pd.concat([existing_df, merged_df], ignore_index=True)
+          .drop_duplicates(subset="datetime", keep="last")
+          .sort_values("datetime")
+          .reset_index(drop=True)
+    )
+
+    # 6. Feature engineering
+    print(" Engineering features...")
+    combined_df = add_time_features(combined_df)
+    combined_df = add_lag_and_rolling_features(
+        combined_df, recompute_tail=max(48, len(merged_df) + 24)
+    )
+
+    missing = set(FEATURE_COLUMNS) - set(combined_df.columns)
+    if missing:
+        print(f"❌ Missing engineered columns: {missing}")
+        return False
+    combined_df = combined_df[FEATURE_COLUMNS]
+
+    # 7. Save CSV
+    combined_df.to_csv(DATA_PATH, index=False)
+    print(f"💾 Saved {len(combined_df)} rows → {DATA_PATH}")
+    print(f"   Range: {combined_df['datetime'].min()} → {combined_df['datetime'].max()}")
+
+    # 8. Upload
+    if upload:
+        if not upload_to_hopsworks(combined_df):
+            return False
+    else:
+        print("\nℹ️ --no-upload flag set, skipping Hopsworks")
 
     print("=" * 60)
     print("✅ HOURLY PIPELINE COMPLETE")
@@ -276,6 +398,27 @@ def run_hourly_pipeline():
     return True
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Lahore AQI hourly feature pipeline")
+    parser.add_argument("--past-days", type=int, default=DEFAULT_PAST_DAYS,
+                        help="Days of history to fetch (max 92). Use ~30 to close a gap.")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="Write CSV only, skip Hopsworks")
+    args = parser.parse_args()
+
+    if not 1 <= args.past_days <= 92:
+        print("❌ --past-days must be between 1 and 92")
+        sys.exit(1)
+
+    try:
+        ok = run_hourly_pipeline(past_days=args.past_days, upload=not args.no_upload)
+    except Exception:
+        print("\n❌ PIPELINE CRASHED")
+        traceback.print_exc()
+        sys.exit(1)         
+
+    sys.exit(0 if ok else 1)
+
+
 if __name__ == "__main__":
-    success = run_hourly_pipeline()
-    sys.exit(0 if success else 1)
+    main()
