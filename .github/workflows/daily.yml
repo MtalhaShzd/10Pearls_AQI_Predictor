@@ -71,15 +71,23 @@ jobs:
           echo "python scripts/training_pipeline.py $ARGS"
           python scripts/training_pipeline.py $ARGS
 
-      - name: Commit updated model
+      - name: Commit model metadata
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add models/ridge_aqi_1h.pkl models/metrics.json models/feature_columns.json
+          # The .pkl lives in the Hopsworks Model Registry and is gitignored.
+          # Only commit the small JSON metadata, skipping anything ignored.
+          for f in models/metrics.json models/feature_columns.json; do
+            if [ -f "$f" ] && ! git check-ignore -q "$f"; then
+              git add "$f"
+            else
+              echo "Skipping $f (missing or gitignored)"
+            fi
+          done
 
           if git diff --staged --quiet; then
-            echo "No model changes to commit."
+            echo "No metadata changes to commit."
             exit 0
           fi
 
