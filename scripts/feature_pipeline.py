@@ -268,25 +268,35 @@ def upload_to_hopsworks(combined_df: pd.DataFrame) -> bool:
             f"{FG_NAME} v{FG_VERSION} has stream=False. External writes will fail. "
             f"Set HOPSWORKS_FEATURE_GROUP_VERSION to a streaming-enabled version."
         )
-        
-    # Hopsworks is the source of truth, NOT the local CSV.
-    # CI runners are ephemeral, so the CSV watermark cannot be trusted.
+
+    
     try:
         existing = fg.read()
-        watermark = pd.to_datetime(existing["datetime"]).max() if len(existing) else pd.Timestamp.min
-        print(f"   Feature store currently holds {len(existing)} rows up to {watermark}")
+        remote_hours = pd.DatetimeIndex(
+            pd.to_datetime(existing["datetime"]).dt.floor("h").unique()
+        )
+        print(f"   Feature store holds {len(existing)} rows"
+              + (f", latest {remote_hours.max()}" if len(remote_hours) else " (empty)"))
     except Exception as e:
-        print(f"   ⚠️ Could not read feature group ({e}) — uploading recent window anyway")
-        watermark = pd.Timestamp.min
+        print(f"   ⚠️ Could not read feature group ({e}) — will upload everything")
+        remote_hours = pd.DatetimeIndex([])
 
-    cutoff = (watermark - pd.Timedelta(hours=OVERLAP_HOURS)
-              if watermark != pd.Timestamp.min else pd.Timestamp.min)
-    upload_df = combined_df[combined_df["datetime"] > cutoff].copy()
+    local_hours = combined_df["datetime"].dt.floor("h")
+
+    missing_mask = ~local_hours.isin(remote_hours)          # anywhere in the series
+    if len(remote_hours):
+        overlap_cutoff = combined_df["datetime"].max() - pd.Timedelta(hours=OVERLAP_HOURS)
+        overlap_mask = combined_df["datetime"] > overlap_cutoff   # refresh recent lags
+    else:
+        overlap_mask = pd.Series(False, index=combined_df.index)
+
+    n_missing = int(missing_mask.sum())
+    upload_df = combined_df[missing_mask | overlap_mask].copy()
 
     if upload_df.empty:
-        print("ℹ️ Feature store already up to date — nothing to upload")
+        print("ℹ️ Feature store already in sync — nothing to upload")
         return True
-
+        
     # --- dtype hygiene ---
     upload_df["datetime"] = (
         pd.to_datetime(upload_df["datetime"])
@@ -303,9 +313,8 @@ def upload_to_hopsworks(combined_df: pd.DataFrame) -> bool:
         raise ValueError(f"DataFrame missing columns required by feature group: {missing}")
     upload_df = upload_df[schema]
 
-    n_new = (upload_df["datetime"] > watermark).sum()
-    print(f"   Sending {len(upload_df)} rows ({n_new} new, "
-          f"{len(upload_df) - n_new} re-sent to refresh lag features)")
+    print(f"   Sending {len(upload_df)} rows ({n_missing} missing, "
+          f"{len(upload_df) - n_missing} re-sent to refresh lag features)")
 
     # datetime is the primary key, so overlapping rows upsert rather than duplicate.
     fg.insert(upload_df, write_options={"wait_for_job": False})
