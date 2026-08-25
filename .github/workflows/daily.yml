@@ -2,27 +2,42 @@ name: Daily Training Pipeline
 
 on:
   schedule:
-    # Runs every day at 02:00 UTC
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * *"       # 02:00 UTC = 07:00 Lahore
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "models/**"
-      - "*.md"
+    inputs:
+      source:
+        description: "Data source"
+        type: choice
+        options: [auto, hopsworks, csv]
+        default: auto
+      force_register:
+        description: "Register even if metrics did not improve"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: aqi-train
+  cancel-in-progress: false
+
 jobs:
   run-daily-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+      HOPSWORKS_HOST: eu-west.cloud.hopsworks.ai
+      HOPSWORKS_PROJECT: internship10P
+      HOPSWORKS_FEATURE_GROUP: lahore_air_quality_features
+      HOPSWORKS_FEATURE_GROUP_VERSION: "2"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -34,40 +49,46 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-train.txt
 
-      - name: Create .env file
+      #  Training reads from Hopsworks by default,
+      # so a missing CSV is no longer a fatal condition.
+      - name: Report local data status
         run: |
-          echo "HOPSWORKS_API_KEY=${{ secrets.HOPSWORKS_API_KEY }}" >> .env
-          echo "HOPSWORKS_PROJECT=internship10P" >> .env
-
-      - name: Check if training data exists
-        run: |
-          if [ ! -f data/processed/lahore/lahore_features_hourly.csv ]; then
-            echo "❌ No training data found."
-            echo "Please run the hourly pipeline first to generate data."
-            exit 1
+          F=data/processed/lahore/lahore_features_hourly.csv
+          if [ -f "$F" ]; then
+            echo "Local CSV present: $(wc -l < $F) lines"
+          else
+            echo "No local CSV - will read from the feature store"
           fi
-          echo "✅ Training data found"
 
       - name: Run daily training pipeline
-        env:
-          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-        run: python scripts/training_pipeline.py
+        run: |
+          ARGS="--source ${{ inputs.source || 'auto' }}"
+          if [ "${{ inputs.force_register }}" != "true" ]; then
+            ARGS="$ARGS --only-if-better"      # FIX #3 - stops version sprawl
+          fi
+          echo "python scripts/training_pipeline.py $ARGS"
+          python scripts/training_pipeline.py $ARGS
 
       - name: Commit updated model
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # 1. Stage only the models folder
-          git add models/
-          
-          # 2. Check if there are changes; if yes, commit, pull rebase, and push
-          if ! git diff --staged --quiet; then
-            git commit -m "chore: daily model retrain $(date -u +'%Y-%m-%d %H:%M:%S UTC') [skip ci]"
-            git pull --rebase --autostash origin main
-            git push origin main
-          else
-            echo "No changes in models/ to commit."
+
+          git add models/ridge_aqi_1h.pkl models/metrics.json models/feature_columns.json
+
+          if git diff --staged --quiet; then
+            echo "No model changes to commit."
+            exit 0
           fi
+
+          git commit -m "chore: daily model retrain $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
+
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin main && git push origin main && exit 0
+            echo "Push attempt $i failed, retrying..."
+            sleep $((5 * i))
+          done
+          echo "::error::Failed to push after 3 attempts"
+          exit 1
