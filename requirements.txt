@@ -25,3 +25,5 @@ APScheduler
 ipykernel
 gunicorn
 flask-cors
+confluent-kafka
+fastavro
