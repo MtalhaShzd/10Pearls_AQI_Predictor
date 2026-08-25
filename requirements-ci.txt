@@ -1,0 +1,7 @@
+hopsworks[python]
+confluent-kafka
+fastavro
+
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+python-dotenv>=1.0,<2.0
