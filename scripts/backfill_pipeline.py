@@ -1,23 +1,25 @@
 """
-One-Time Backfill Pipeline
+Backfill Pipeline — Lahore AQI
+==============================
+Detects missing hourly timestamps, fetches them from Open-Meteo, recomputes
+lag/rolling features for the whole series, and upserts the affected rows into
+Hopsworks (lahore_air_quality_features v2).
 
-Fetches missing hourly weather and pollutant data and fills gaps in:
-data/processed/lahore/lahore_features_hourly.csv
-
-This pipeline:
-1. Detects missing hourly timestamps.
-2. Fetches historical weather and air-quality data from Open-Meteo.
-3. Recomputes time, lag, and rolling features for the full dataset.
-4. Saves the corrected CSV.
-5. Uploads the corrected data to Hopsworks Feature Store if API key exists.
+Usage:
+    python src/backfill_pipeline.py
+    python src/backfill_pipeline.py --start 2026-08-01 --end 2026-08-25
+    python src/backfill_pipeline.py --no-upload
+    python src/backfill_pipeline.py --full-upload      # re-send every row
 """
 
+import argparse
+import json
 import os
 import sys
 import time
-import json
-import warnings
+import traceback
 import urllib.request
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -32,424 +34,351 @@ sys.path.append(str(PROJECT_ROOT))
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "lahore" / "lahore_features_hourly.csv"
 DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-LAT = 31.5204
-LON = 74.3587
+LAT, LON = 31.5204, 74.3587
+CITY_TZ = "Asia/Karachi"
 
-FEATURE_GROUP_NAME = os.getenv("HOPSWORKS_FEATURE_GROUP", "lahore_air_quality_features")
-FEATURE_GROUP_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1"))
+FG_NAME = os.getenv("HOPSWORKS_FEATURE_GROUP", "lahore_air_quality_features")
+FG_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "2"))   # v2, not 1
+
+ARCHIVE_LAG_DAYS = 7      # archive-api (ERA5) trails real time by ~5 days
+AFFECTED_WINDOW_H = 24    # filling hour T changes lags for the next 24 hours
+
+INT_COLS = ["hour", "day", "month", "day_of_week", "is_weekend"]
+
+WEATHER_VARS = ("temperature_2m,relative_humidity_2m,surface_pressure,precipitation,"
+                "cloud_cover,wind_speed_10m,wind_direction_10m")
+POLLUTANT_VARS = "pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,us_aqi"
 
 FINAL_COLUMNS = [
-    "datetime",
-    "temperature_2m",
-    "relative_humidity_2m",
-    "surface_pressure",
-    "precipitation",
-    "cloud_cover",
-    "wind_speed_10m",
-    "wind_direction_10m",
-    "pm2_5",
-    "pm10",
-    "carbon_monoxide",
-    "nitrogen_dioxide",
-    "sulphur_dioxide",
-    "ozone",
-    "us_aqi",
-    "hour",
-    "day",
-    "month",
-    "day_of_week",
-    "is_weekend",
-    "hour_sin",
-    "hour_cos",
-    "month_sin",
-    "month_cos",
-    "aqi_change_rate",
-    "aqi_lag_1h",
-    "aqi_lag_24h",
-    "aqi_rolling_mean_6h",
-    "aqi_rolling_std_6h",
+    "datetime", "temperature_2m", "relative_humidity_2m", "surface_pressure",
+    "precipitation", "cloud_cover", "wind_speed_10m", "wind_direction_10m",
+    "pm2_5", "pm10", "carbon_monoxide", "nitrogen_dioxide", "sulphur_dioxide",
+    "ozone", "us_aqi", "hour", "day", "month", "day_of_week", "is_weekend",
+    "hour_sin", "hour_cos", "month_sin", "month_cos", "aqi_change_rate",
+    "aqi_lag_1h", "aqi_lag_24h", "aqi_rolling_mean_6h", "aqi_rolling_std_6h",
     "pm25_rolling_mean_6h",
 ]
 
 
-def read_json_from_url(url, timeout=60):
-    """Read JSON from URL with small retry handling."""
-    last_error = None
+def now_local() -> pd.Timestamp:
+    """FIX: pd.Timestamp.now() is UTC on CI; Lahore is UTC+5."""
+    return pd.Timestamp.now(tz=CITY_TZ).tz_localize(None)
 
-    for attempt in range(1, 4):
+
+def get_json(url, retries=3, timeout=60):
+    err = None
+    for i in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return json.loads(r.read().decode())
         except Exception as e:
-            last_error = e
-            print(f"⚠️ API request failed attempt {attempt}/3: {e}")
-            if attempt < 3:
-                time.sleep(5 * attempt)
+            err = e
+            print(f"   ⚠️ attempt {i}/{retries}: {e}")
+            if i < retries:
+                time.sleep(5 * i)
+    raise RuntimeError(f"Request failed:\n{url}\n{err}")
 
-    raise last_error
 
-
-def fetch_historical_weather(start_date, end_date):
-    """Fetch historical weather between two dates."""
-    url = (
-        f"https://archive-api.open-meteo.com/v1/archive?"
-        f"latitude={LAT}&longitude={LON}"
-        f"&start_date={start_date}&end_date={end_date}"
-        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,"
-        f"precipitation,cloud_cover,wind_speed_10m,wind_direction_10m"
-        f"&timezone=auto"
+def hopsworks_login():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    key = os.getenv("HOPSWORKS_API_KEY")
+    if not key:
+        return None
+    import hopsworks
+    return hopsworks.login(
+        host=os.getenv("HOPSWORKS_HOST", "eu-west.cloud.hopsworks.ai"),
+        project=os.getenv("HOPSWORKS_PROJECT", "internship10P"),
+        api_key_value=key,
     )
 
-    print(f"📡 Fetching weather from {start_date} to {end_date}...")
-    data = read_json_from_url(url)
 
-    if "hourly" not in data:
-        raise ValueError(f"Weather API returned no hourly data: {data}")
-
-    hourly = data["hourly"]
-
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(hourly["time"]),
-        "temperature_2m": hourly["temperature_2m"],
-        "relative_humidity_2m": hourly["relative_humidity_2m"],
-        "surface_pressure": hourly["surface_pressure"],
-        "precipitation": hourly["precipitation"],
-        "cloud_cover": hourly["cloud_cover"],
-        "wind_speed_10m": hourly["wind_speed_10m"],
-        "wind_direction_10m": hourly["wind_direction_10m"],
-    })
-
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+# --------------------------------------------------------------------------
+# FETCH — hybrid archive / forecast
+# --------------------------------------------------------------------------
+def _frame(hourly, cols):
+    d = {"datetime": pd.to_datetime(hourly["time"])}
+    d.update({c: hourly[c] for c in cols})
+    df = pd.DataFrame(d)
+    df["datetime"] = df["datetime"].dt.tz_localize(None)
     return df
 
 
-def fetch_historical_pollutants(start_date, end_date):
-    """Fetch historical pollutant data."""
-    url = (
-        f"https://air-quality-api.open-meteo.com/v1/air-quality?"
-        f"latitude={LAT}&longitude={LON}"
-        f"&hourly=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,"
-        f"sulphur_dioxide,ozone,us_aqi"
-        f"&start_date={start_date}&end_date={end_date}"
-        f"&timezone=auto"
-    )
-
-    print(f"📡 Fetching pollutants from {start_date} to {end_date}...")
-    data = read_json_from_url(url)
-
-    if "hourly" not in data:
-        raise ValueError(f"Air-quality API returned no hourly data: {data}")
-
-    hourly = data["hourly"]
-
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(hourly["time"]),
-        "pm2_5": hourly["pm2_5"],
-        "pm10": hourly["pm10"],
-        "carbon_monoxide": hourly["carbon_monoxide"],
-        "nitrogen_dioxide": hourly["nitrogen_dioxide"],
-        "sulphur_dioxide": hourly["sulphur_dioxide"],
-        "ozone": hourly["ozone"],
-        "us_aqi": hourly["us_aqi"],
-    })
-
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-    return df
+WEATHER_COLS = ["temperature_2m", "relative_humidity_2m", "surface_pressure",
+                "precipitation", "cloud_cover", "wind_speed_10m", "wind_direction_10m"]
+POLLUTANT_COLS = ["pm2_5", "pm10", "carbon_monoxide", "nitrogen_dioxide",
+                  "sulphur_dioxide", "ozone", "us_aqi"]
 
 
+def fetch_weather_range(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """FIX: archive-api returns nulls for the last ~5 days, which dropna() then
+    erased — so recent gaps could never be filled. We now split the request:
+    archive for older dates, forecast (past_days) for recent ones.
+    """
+    today = now_local().normalize()
+    cutoff = today - pd.Timedelta(days=ARCHIVE_LAG_DAYS)
+    parts = []
+
+    if start < cutoff:
+        a_end = min(end, cutoff - pd.Timedelta(days=1))
+        print(f"   archive  {start:%Y-%m-%d} → {a_end:%Y-%m-%d}")
+        h = get_json(
+            f"https://archive-api.open-meteo.com/v1/archive?latitude={LAT}&longitude={LON}"
+            f"&start_date={start:%Y-%m-%d}&end_date={a_end:%Y-%m-%d}"
+            f"&hourly={WEATHER_VARS}&timezone=auto"
+        )["hourly"]
+        parts.append(_frame(h, WEATHER_COLS))
+
+    if end >= cutoff:
+        r_start = max(start, cutoff)
+        past_days = min(92, (today - r_start).days + 1)
+        print(f"   🛰️ forecast past_days={past_days} (for {r_start:%Y-%m-%d} → {end:%Y-%m-%d})")
+        h = get_json(
+            f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
+            f"&hourly={WEATHER_VARS}&past_days={past_days}&forecast_days=1&timezone=auto"
+        )["hourly"]
+        df = _frame(h, WEATHER_COLS)
+        parts.append(df[(df["datetime"] >= r_start) &
+                        (df["datetime"] < end + pd.Timedelta(days=1))])
+
+    return (pd.concat(parts, ignore_index=True)
+              .drop_duplicates("datetime", keep="last")
+              .sort_values("datetime").reset_index(drop=True))
+
+
+def fetch_pollutant_range(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    print(f"   🌫️ pollutants {start:%Y-%m-%d} → {end:%Y-%m-%d}")
+    h = get_json(
+        f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={LAT}&longitude={LON}"
+        f"&hourly={POLLUTANT_VARS}&start_date={start:%Y-%m-%d}&end_date={end:%Y-%m-%d}&timezone=auto"
+    )["hourly"]
+    return _frame(h, POLLUTANT_COLS)
+
+
+# --------------------------------------------------------------------------
+# FEATURES
+# --------------------------------------------------------------------------
 def add_time_features(df):
-    """Add cyclical and calendar features."""
     df = df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-
     df["hour"] = df["datetime"].dt.hour
     df["day"] = df["datetime"].dt.day
     df["month"] = df["datetime"].dt.month
     df["day_of_week"] = df["datetime"].dt.dayofweek
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
-
     df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
     df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
-
     df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12.0)
     df["month_cos"] = np.cos(2 * np.pi * (df["month"] - 1) / 12.0)
-
     return df
 
 
 def add_lag_and_rolling_features(df):
-    """
-    Recompute lag and rolling features for the full dataset.
-
-    This is important for backfill because gaps may exist in the middle,
-    not only at the latest rows.
-    """
-    df = df.copy()
+    """Full recompute — correct for backfill, since a mid-series gap invalidates
+    the lag/rolling values of every row that follows it."""
     df = df.sort_values("datetime").reset_index(drop=True)
+    aqi, pm25 = df["us_aqi"], df["pm2_5"]
 
-    df["aqi_lag_1h"] = df["us_aqi"].shift(1)
-    df["aqi_lag_24h"] = df["us_aqi"].shift(24)
-
-    df["aqi_change_rate"] = (
-        (df["us_aqi"].shift(1) - df["us_aqi"].shift(2)) /
-        (df["us_aqi"].shift(2) + 1e-5)
-    )
-
-    df["aqi_rolling_mean_6h"] = (
-        df["us_aqi"]
-        .rolling(window=6, min_periods=1)
-        .mean()
-    )
-
-    df["aqi_rolling_std_6h"] = (
-        df["us_aqi"]
-        .rolling(window=6, min_periods=1)
-        .std()
-        .fillna(0.0)
-    )
-
-    df["pm25_rolling_mean_6h"] = (
-        df["pm2_5"]
-        .rolling(window=6, min_periods=1)
-        .mean()
-    )
-
-    df["aqi_lag_1h"] = df["aqi_lag_1h"].fillna(df["us_aqi"])
-    df["aqi_lag_24h"] = df["aqi_lag_24h"].fillna(df["us_aqi"])
-    df["aqi_change_rate"] = df["aqi_change_rate"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
+    df["aqi_lag_1h"] = aqi.shift(1).fillna(aqi)
+    df["aqi_lag_24h"] = aqi.shift(24).fillna(aqi)
+    df["aqi_change_rate"] = (((aqi.shift(1) - aqi.shift(2)) / (aqi.shift(2) + 1e-5))
+                             .replace([np.inf, -np.inf], 0.0).fillna(0.0))
+    df["aqi_rolling_mean_6h"] = aqi.rolling(6, min_periods=1).mean()
+    df["aqi_rolling_std_6h"] = aqi.rolling(6, min_periods=1).std().fillna(0.0)
+    df["pm25_rolling_mean_6h"] = pm25.rolling(6, min_periods=1).mean()
     return df
 
 
 def enforce_schema(df):
-    """Clean column order and enforce stable dtypes."""
     df = df.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None).astype("datetime64[us]")
+    for c in [c for c in FINAL_COLUMNS if c != "datetime"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in INT_COLS:
+        df[c] = df[c].fillna(0).astype("int64")
+    for c in [c for c in FINAL_COLUMNS if c not in INT_COLS + ["datetime"]]:
+        df[c] = df[c].astype("float64")
+    return df[FINAL_COLUMNS]
+
+
+# --------------------------------------------------------------------------
+# GAP DETECTION
+# --------------------------------------------------------------------------
+def find_missing_hours(df, end=None):
+    """FIX: the old version only searched BETWEEN min and max, so it reported
+    'no gaps' for the trailing Aug 1 → Aug 25 hole. We now extend to now().
+    """
+    have = pd.DatetimeIndex(pd.to_datetime(df["datetime"]).dt.floor("h").unique())
+    start = have.min()
+    end = (pd.Timestamp(end) if end is not None else now_local()).floor("h")
+    if end < have.max():
+        end = have.max()
+    return pd.date_range(start, end, freq="h").difference(have)
+
+
+def group_into_ranges(hours, max_days=90):
+    if len(hours) == 0:
+        return []
+    days = sorted({h.normalize() for h in hours})
+    ranges, s, prev = [], days[0], days[0]
+    for d in days[1:]:
+        if (d - prev).days > 1 or (d - s).days >= max_days:
+            ranges.append((s, prev))
+            s = d
+        prev = d
+    ranges.append((s, prev))
+    return ranges
+
+
+# --------------------------------------------------------------------------
+# LOAD / UPLOAD
+# --------------------------------------------------------------------------
+def load_base(project):
+    if DATA_PATH.exists():
+        print(f"📂 CSV: {DATA_PATH}")
+        df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
+    elif project is not None:
+        print(f"📥 No CSV — bootstrapping from {FG_NAME} v{FG_VERSION}")
+        df = project.get_feature_store().get_feature_group(FG_NAME, version=FG_VERSION).read()
+    else:
+        raise FileNotFoundError("No CSV and no Hopsworks access")
 
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-
-    int_columns = [
-        "hour",
-        "day",
-        "month",
-        "day_of_week",
-        "is_weekend",
-    ]
-
-    numeric_columns = [col for col in FINAL_COLUMNS if col not in ["datetime"]]
-
-    for col in numeric_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    for col in int_columns:
-        if col in df.columns:
-            df[col] = df[col].fillna(0).astype("int64")
-
-    float_columns = [col for col in numeric_columns if col not in int_columns]
-    for col in float_columns:
-        if col in df.columns:
-            df[col] = df[col].astype("float64")
-
-    df = df[FINAL_COLUMNS]
-    return df
+    return (df.drop_duplicates("datetime", keep="last")
+              .sort_values("datetime").reset_index(drop=True))
 
 
-def find_missing_hourly_ranges(existing_df):
-    """Find missing hourly timestamps and convert them into date ranges for API calls."""
-    existing_df = existing_df.copy()
-    existing_df["datetime"] = pd.to_datetime(existing_df["datetime"]).dt.tz_localize(None)
-    existing_df = existing_df.sort_values("datetime").reset_index(drop=True)
+def upload(project, df, affected: pd.DatetimeIndex, full=False):
+    """Upsert only the rows whose values actually changed.
 
-    first_ts = existing_df["datetime"].min().floor("h")
-    last_ts = existing_df["datetime"].max().floor("h")
+    FIX: the old version pushed all 22k+ rows through Kafka on every run.
+    """
+    if project is None:
+        print("ℹ️ No HOPSWORKS_API_KEY — skipping upload")
+        return
 
-    expected_hours = pd.date_range(start=first_ts, end=last_ts, freq="h")
-    existing_hours = pd.DatetimeIndex(existing_df["datetime"].dt.floor("h").unique())
+    fs = project.get_feature_store()
+    fg = fs.get_feature_group(FG_NAME, version=FG_VERSION)
 
-    missing_hours = expected_hours.difference(existing_hours)
+    if getattr(fg, "stream", False) is not True:
+        raise RuntimeError(
+            f"{FG_NAME} v{FG_VERSION} has stream=False. External writes will fail "
+            f"with 'RPC listener disconnected'. Point FG_VERSION at the streaming version."
+        )
 
-    if len(missing_hours) == 0:
-        return missing_hours, []
+    out = df if full else df[df["datetime"].isin(affected)]
+    if out.empty:
+        print("ℹ️ Nothing changed — no upload needed")
+        return
 
-    missing_dates = sorted(pd.to_datetime(pd.Series(missing_hours.date).unique()))
-
-    ranges = []
-    start = pd.Timestamp(missing_dates[0])
-    prev = pd.Timestamp(missing_dates[0])
-
-    for d in missing_dates[1:]:
-        d = pd.Timestamp(d)
-        if (d - prev).days > 1:
-            ranges.append((start, prev))
-            start = d
-        prev = d
-
-    ranges.append((start, prev))
-    return missing_hours, ranges
+    print(f"\n📤 Upserting {len(out)} rows into {FG_NAME} v{FG_VERSION}...")
+    fg.insert(out, write_options={"wait_for_job": True})
+    print(f"   ✅ Done ({out['datetime'].min()} → {out['datetime'].max()})")
 
 
-def upload_to_hopsworks(df):
-    """Upload corrected data to Hopsworks Feature Store."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-
-        api_key = os.getenv("HOPSWORKS_API_KEY")
-
-        if not api_key:
-            print("ℹ️ No HOPSWORKS_API_KEY found. Skipping Hopsworks upload.")
-            return
-
-        print("\n📤 Uploading corrected data to Hopsworks Feature Store...")
-        print(f"Feature group: {FEATURE_GROUP_NAME}, version: {FEATURE_GROUP_VERSION}")
-        print(f"Rows to upload: {len(df)}")
-
-        import hopsworks
-
-        project = hopsworks.login(api_key_value=api_key)
-        fs = project.get_feature_store()
-        fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
-
-        last_error = None
-
-        for attempt in range(1, 4):
-            try:
-                print(f"Upload attempt {attempt}/3...")
-
-                try:
-                    fg.insert(
-                        df,
-                        write_options={"wait_for_job": True}
-                    )
-                except TypeError:
-                    # Compatibility fallback for older HSFS versions
-                    fg.insert(df, wait=True)
-
-                print("✅ Hopsworks upload complete")
-                return
-
-            except Exception as e:
-                last_error = e
-                print(f"⚠️ Hopsworks upload attempt {attempt}/3 failed: {e}")
-                if attempt < 3:
-                    time.sleep(15 * attempt)
-
-        print(f"⚠️ Hopsworks upload skipped after retries: {last_error}")
-
-    except Exception as e:
-        print(f"⚠️ Hopsworks upload skipped: {e}")
-
-
-def run_backfill():
-    """Main backfill execution function."""
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+def run_backfill(start=None, end=None, do_upload=True, full_upload=False) -> bool:
     print("=" * 60)
     print("🔄 BACKFILL PIPELINE STARTED")
-    print(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Run time (Lahore): {now_local():%Y-%m-%d %H:%M:%S}")
     print("=" * 60)
 
-    if not DATA_PATH.exists():
-        print(f"❌ No existing data file found at: {DATA_PATH}")
-        print("Please run the hourly feature pipeline first.")
-        return False
+    project = hopsworks_login() if do_upload else None
+    base = load_base(project)
+    print(f"Existing rows: {len(base)}  ({base['datetime'].min()} → {base['datetime'].max()})")
 
-    existing_df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
-    existing_df["datetime"] = pd.to_datetime(existing_df["datetime"]).dt.tz_localize(None)
-    existing_df = existing_df.sort_values("datetime").reset_index(drop=True)
+    if start and end:
+        missing = pd.date_range(pd.Timestamp(start), pd.Timestamp(end).replace(hour=23),
+                                freq="h").difference(
+                      pd.DatetimeIndex(base["datetime"].dt.floor("h").unique()))
+    else:
+        missing = find_missing_hours(base)
 
-    print(f"Existing rows: {len(existing_df)}")
-    print(f"Existing date range: {existing_df['datetime'].min()} to {existing_df['datetime'].max()}")
-
-    missing_hours, ranges = find_missing_hourly_ranges(existing_df)
-
-    if len(missing_hours) == 0:
-        print("✅ No hourly gaps found in existing data.")
-        print("=" * 60)
-        print("✅ BACKFILL COMPLETE")
-        print("=" * 60)
+    if len(missing) == 0:
+        print("✅ No hourly gaps found")
         return True
 
-    print(f"📅 Found {len(missing_hours)} missing hourly timestamps.")
-    print(f"📅 Found {len(ranges)} date ranges to fetch:")
+    ranges = group_into_ranges(missing)
+    print(f"📅 {len(missing)} missing hours across {len(ranges)} range(s):")
+    for s, e in ranges:
+        print(f"   {s:%Y-%m-%d} → {e:%Y-%m-%d}")
 
-    for start_date, end_date in ranges:
-        print(f"   {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-
-    all_backfill_dfs = []
-
-    for start_date, end_date in ranges:
-        start_str = start_date.strftime("%Y-%m-%d")
-        end_str = end_date.strftime("%Y-%m-%d")
-
+    fetched = []
+    for s, e in ranges:
+        print(f"\n▶ {s:%Y-%m-%d} → {e:%Y-%m-%d}")
         try:
-            weather_df = fetch_historical_weather(start_str, end_str)
-            pollutants_df = fetch_historical_pollutants(start_str, end_str)
+            w = fetch_weather_range(s, e)
+            p = fetch_pollutant_range(s, e)
+            m = pd.merge(w, p, on="datetime", how="inner")
+            m = m[m["datetime"].dt.floor("h").isin(missing)].dropna()
+            print(f"   ✅ recovered {len(m)} rows")
+            if len(m):
+                fetched.append(m)
+        except Exception as e2:
+            print(f"   ⚠️ range failed: {e2}")
 
-            merged_df = pd.merge(weather_df, pollutants_df, on="datetime", how="inner")
-            merged_df["datetime"] = pd.to_datetime(merged_df["datetime"]).dt.tz_localize(None)
-
-            # Keep only truly missing hours
-            merged_df = merged_df[
-                merged_df["datetime"].dt.floor("h").isin(missing_hours)
-            ]
-
-            merged_df = merged_df.dropna().sort_values("datetime").reset_index(drop=True)
-
-            print(f"   ✅ Fetched {len(merged_df)} missing rows for {start_str} to {end_str}")
-
-            if len(merged_df) > 0:
-                all_backfill_dfs.append(merged_df)
-
-        except Exception as e:
-            print(f"   ⚠️ Failed to fetch {start_str} to {end_str}: {e}")
-
-    if not all_backfill_dfs:
-        print("❌ No backfill data was fetched.")
+    if not fetched:
+        print("❌ No data recovered from the APIs")
         return False
 
-    backfill_df = pd.concat(all_backfill_dfs, ignore_index=True)
-    backfill_df = backfill_df.drop_duplicates(subset="datetime", keep="last")
-    backfill_df = backfill_df.sort_values("datetime").reset_index(drop=True)
+    new = (pd.concat(fetched, ignore_index=True)
+             .drop_duplicates("datetime", keep="last")
+             .sort_values("datetime").reset_index(drop=True))
+    print(f"\n Recovered {len(new)} rows total")
 
-    print(f"\n🔧 Backfill rows fetched: {len(backfill_df)}")
-    print(f"Backfill date range: {backfill_df['datetime'].min()} to {backfill_df['datetime'].max()}")
+    combined = (pd.concat([base, new], ignore_index=True)
+                  .drop_duplicates("datetime", keep="last")
+                  .sort_values("datetime").reset_index(drop=True))
 
-    # Combine old + new rows
-    combined_df = pd.concat([existing_df, backfill_df], ignore_index=True)
-    combined_df["datetime"] = pd.to_datetime(combined_df["datetime"]).dt.tz_localize(None)
+    print(" Recomputing features across the full series...")
+    combined = enforce_schema(add_lag_and_rolling_features(add_time_features(combined)))
 
-    combined_df = combined_df.drop_duplicates(subset="datetime", keep="last")
-    combined_df = combined_df.sort_values("datetime").reset_index(drop=True)
+    combined.to_csv(DATA_PATH, index=False)
+    print(f" Saved {len(combined)} rows → {DATA_PATH}")
 
-    print("\n🔧 Recomputing features for full corrected dataset...")
-    combined_df = add_time_features(combined_df)
-    combined_df = add_lag_and_rolling_features(combined_df)
-    combined_df = enforce_schema(combined_df)
+    # Filling hour T also changes lag/rolling values for the following 24h.
+    affected = set(new["datetime"])
+    for ts in new["datetime"]:
+        affected.update(pd.date_range(ts, periods=AFFECTED_WINDOW_H + 1, freq="h"))
+    affected = pd.DatetimeIndex(sorted(affected))
 
-    # Save corrected CSV
-    combined_df.to_csv(DATA_PATH, index=False)
+    remaining = find_missing_hours(combined)
+    print(f"🔍 Remaining gaps: {len(remaining)}"
+          + ("" if len(remaining) == 0 else f"  (earliest {remaining.min()})"))
 
-    print(f"\n✅ Saved corrected dataset to: {DATA_PATH}")
-    print(f"Total rows now: {len(combined_df)}")
-    print(f"Date range now: {combined_df['datetime'].min()} to {combined_df['datetime'].max()}")
-
-    # Verify remaining gaps
-    remaining_missing_hours, _ = find_missing_hourly_ranges(combined_df)
-
-    if len(remaining_missing_hours) == 0:
-        print("✅ Verification passed: no remaining hourly gaps.")
-    else:
-        print(f"⚠️ Verification warning: {len(remaining_missing_hours)} hourly gaps still remain.")
-
-    # Upload full corrected dataset to Hopsworks
-    upload_to_hopsworks(combined_df)
+    if do_upload:
+        upload(project, combined, affected, full_upload)
 
     print("=" * 60)
     print("✅ BACKFILL COMPLETE")
     print("=" * 60)
-
     return True
 
 
+def main():
+    p = argparse.ArgumentParser(description="Lahore AQI backfill pipeline")
+    p.add_argument("--start", help="YYYY-MM-DD (forces a range)")
+    p.add_argument("--end", help="YYYY-MM-DD")
+    p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--full-upload", action="store_true", help="Re-send every row")
+    a = p.parse_args()
+
+    if bool(a.start) != bool(a.end):
+        print("❌ --start and --end must be used together")
+        sys.exit(1)
+
+    try:
+        ok = run_backfill(a.start, a.end, not a.no_upload, a.full_upload)
+    except Exception:
+        print("\n❌ BACKFILL FAILED")
+        traceback.print_exc()
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
+
+
 if __name__ == "__main__":
-    success = run_backfill()
-    sys.exit(0 if success else 1)
+    main()
