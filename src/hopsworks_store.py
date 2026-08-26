@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 MODEL_NAME = os.getenv("MODEL_NAME", "lahore_aqi_ridge_1h")
 FEATURE_GROUP_NAME = os.getenv("HOPSWORKS_FEATURE_GROUP", "lahore_air_quality_features")
-FEATURE_GROUP_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "1"))
+FEATURE_GROUP_VERSION = int(os.getenv("HOPSWORKS_FEATURE_GROUP_VERSION", "2"))
 
 LOCAL_MODEL_DIR = PROJECT_ROOT / "models"
 LOCAL_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "lahore" / "lahore_features_hourly.csv"
