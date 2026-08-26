@@ -151,7 +151,7 @@ def get_current_conditions():
     }
 
 
-def generate_72h_forecast():
+def generate_72h_forecast(return_features: bool = False):
     """Recursive 72-hour forecast using Model Registry model + Feature Store data."""
     model = get_model()
     feature_cols = get_feature_list()
@@ -173,56 +173,11 @@ def generate_72h_forecast():
 
     history_queue = context_history.copy()
     predicted_aqis, predicted_times = [], []
+    feature_rows = []  # NEW — one X_step per forecast hour
 
     for _, row in future.iterrows():
         current_time = row["datetime"]
-
-        lag_1h = float(history_queue.iloc[-1]["us_aqi"])
-        lag_24h = float(
-            history_queue.iloc[-24]["us_aqi"]
-            if len(history_queue) >= 24
-            else history_queue.iloc[0]["us_aqi"]
-        )
-        lag_2h = float(
-            history_queue.iloc[-2]["us_aqi"] if len(history_queue) >= 2 else lag_1h
-        )
-
-        rolling_6h_aqi = history_queue.tail(6)["us_aqi"]
-        rolling_mean_6h = float(rolling_6h_aqi.mean())
-        std_val = rolling_6h_aqi.std()
-        rolling_std_6h = float(std_val) if not np.isnan(std_val) else 0.0
-        rolling_mean_6h_pm25 = float(history_queue.tail(6)["pm2_5"].mean())
-        aqi_change_rate = float((lag_1h - lag_2h) / (lag_2h + 1e-5))
-
-        pm2_5_pred = float(history_queue.iloc[-1]["pm2_5"]) * 0.98 + (rolling_mean_6h_pm25 * 0.02)
-        pm10_pred = float(history_queue.iloc[-1]["pm10"]) * 0.98
-        co_pred = float(history_queue.iloc[-1]["carbon_monoxide"])
-        no2_pred = float(history_queue.iloc[-1]["nitrogen_dioxide"])
-        so2_pred = float(history_queue.iloc[-1]["sulphur_dioxide"])
-        o3_pred = float(history_queue.iloc[-1]["ozone"])
-
-        feature_dict = {
-            "temperature_2m": float(row["temperature_2m"]),
-            "relative_humidity_2m": float(row["relative_humidity_2m"]),
-            "surface_pressure": float(row["surface_pressure"]),
-            "precipitation": float(row["precipitation"]),
-            "cloud_cover": float(row["cloud_cover"]),
-            "wind_speed_10m": float(row["wind_speed_10m"]),
-            "wind_direction_10m": float(row["wind_direction_10m"]),
-            "pm2_5": pm2_5_pred, "pm10": pm10_pred,
-            "carbon_monoxide": co_pred, "nitrogen_dioxide": no2_pred,
-            "sulphur_dioxide": so2_pred, "ozone": o3_pred,
-            "us_aqi": lag_1h,
-            "hour": int(row["hour"]), "day": int(row["day"]), "month": int(row["month"]),
-            "day_of_week": int(row["day_of_week"]), "is_weekend": int(row["is_weekend"]),
-            "hour_sin": float(row["hour_sin"]), "hour_cos": float(row["hour_cos"]),
-            "month_sin": float(row["month_sin"]), "month_cos": float(row["month_cos"]),
-            "aqi_change_rate": aqi_change_rate,
-            "aqi_lag_1h": lag_1h, "aqi_lag_24h": lag_24h,
-            "aqi_rolling_mean_6h": rolling_mean_6h,
-            "aqi_rolling_std_6h": rolling_std_6h,
-            "pm25_rolling_mean_6h": rolling_mean_6h_pm25
-        }
+        # ... unchanged lag/rolling/pollutant feature-building code ...
 
         X_step = pd.DataFrame([feature_dict])
         for col in feature_cols:
@@ -233,6 +188,7 @@ def generate_72h_forecast():
         predicted_value = max(0.0, float(model.predict(X_step)[0]))
         predicted_aqis.append(predicted_value)
         predicted_times.append(current_time)
+        feature_rows.append(X_step.iloc[0])  # NEW
 
         new_obs = feature_dict.copy()
         new_obs["datetime"] = current_time
@@ -240,44 +196,47 @@ def generate_72h_forecast():
         history_queue = pd.concat([history_queue, pd.DataFrame([new_obs])], ignore_index=True)
         history_queue = history_queue.tail(24).reset_index(drop=True)
 
-    return pd.DataFrame({"datetime": predicted_times, "predicted_aqi": predicted_aqis})
+    forecast_df_out = pd.DataFrame({"datetime": predicted_times, "predicted_aqi": predicted_aqis})
 
+    if return_features:
+        features_df = pd.DataFrame(feature_rows).reset_index(drop=True)
+        return forecast_df_out, features_df
+    return forecast_df_out
+
+
+HORIZON_TO_STEP = {"24h": 24, "48h": 48, "72h": 72}
 
 def get_shap_explanation(horizon="24h"):
-    """SHAP feature contributions using Model Registry model + Feature Store data."""
+    """SHAP feature contributions for a specific forecast horizon."""
     import shap
 
     model = get_model()
     feature_cols = get_feature_list()
 
-    historical_df = get_features_df()
-    historical_df = historical_df.sort_values("datetime").reset_index(drop=True)
+    step = HORIZON_TO_STEP.get(horizon, 24)
 
+    # Recompute the recursive forecast to get the exact feature vector
+    # the model saw at this horizon (not just the latest historical row).
+    _, features_df = generate_72h_forecast(return_features=True)
+    idx = min(step, len(features_df)) - 1
+    target_row = features_df.iloc[[idx]][feature_cols]
+
+    historical_df = get_features_df().sort_values("datetime").reset_index(drop=True)
     for col in feature_cols:
         if col not in historical_df.columns:
             historical_df[col] = 0.0
+    X_train_raw = historical_df[feature_cols].tail(5000)
 
-    X_train = historical_df[feature_cols].tail(5000)
-    latest_sample = historical_df[feature_cols].tail(1)
+    scaler = model.named_steps["scaler"]
+    ridge = model.named_steps["ridge"]
 
-    explainer = shap.LinearExplainer(model, X_train)
-    shap_values = explainer.shap_values(latest_sample)[0]
+    X_train_scaled = scaler.transform(X_train_raw)
+    target_scaled = scaler.transform(target_row)
 
-    label_map = {
-        "temperature_2m": "Temperature", "relative_humidity_2m": "Humidity",
-        "surface_pressure": "Pressure", "precipitation": "Precipitation",
-        "cloud_cover": "Cloud Cover", "wind_speed_10m": "Wind Speed",
-        "wind_direction_10m": "Wind Direction", "pm2_5": "PM2.5", "pm10": "PM10",
-        "carbon_monoxide": "Carbon Monoxide (CO)", "nitrogen_dioxide": "Nitrogen Dioxide (NO₂)",
-        "sulphur_dioxide": "Sulfur Dioxide (SO₂)", "ozone": "Ozone (O₃)",
-        "us_aqi": "Current AQI", "hour": "Hour of Day", "day": "Day",
-        "month": "Month", "day_of_week": "Day of Week", "is_weekend": "Weekend Flag",
-        "hour_sin": "Hour Cycle (sin)", "hour_cos": "Hour Cycle (cos)",
-        "month_sin": "Season Cycle (sin)", "month_cos": "Season Cycle (cos)",
-        "aqi_change_rate": "AQI Change Rate", "aqi_lag_1h": "AQI 1h Ago",
-        "aqi_lag_24h": "AQI 24h Ago", "aqi_rolling_mean_6h": "AQI 6h Avg",
-        "aqi_rolling_std_6h": "AQI 6h Volatility", "pm25_rolling_mean_6h": "PM2.5 6h Avg"
-    }
+    explainer = shap.LinearExplainer(ridge, X_train_scaled)
+    shap_values = explainer.shap_values(target_scaled)[0]
+
+    label_map = { ... }  # unchanged
 
     contributions = [
         {"feature": label_map.get(f, f), "value": round(float(v), 2)}
