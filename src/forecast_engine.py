@@ -249,20 +249,16 @@ def generate_72h_forecast(return_features: bool = False):
         return forecast_df_out, features_df
     return forecast_df_out
 
-
-HORIZON_TO_STEP = {"24h": 24, "48h": 48, "72h": 72}
-
 def get_shap_explanation(horizon="24h"):
     """SHAP feature contributions for a specific forecast horizon."""
     import shap
 
+    HORIZON_TO_STEP = {"24h": 24, "48h": 48, "72h": 72}
+    step = HORIZON_TO_STEP.get(horizon, 24)
+
     model = get_model()
     feature_cols = get_feature_list()
 
-    step = HORIZON_TO_STEP.get(horizon, 24)
-
-    # Recompute the recursive forecast to get the exact feature vector
-    # the model saw at this horizon (not just the latest historical row).
     _, features_df = generate_72h_forecast(return_features=True)
     idx = min(step, len(features_df)) - 1
     target_row = features_df.iloc[[idx]][feature_cols]
@@ -273,16 +269,33 @@ def get_shap_explanation(horizon="24h"):
             historical_df[col] = 0.0
     X_train_raw = historical_df[feature_cols].tail(5000)
 
-    scaler = model.named_steps["scaler"]
-    ridge = model.named_steps["ridge"]
+    if hasattr(model, "named_steps"):
+        scaler = model.named_steps.get("scaler")
+        ridge = model.named_steps.get("ridge") or list(model.named_steps.values())[-1]
+    else:
+        scaler, ridge = None, model
 
-    X_train_scaled = scaler.transform(X_train_raw)
-    target_scaled = scaler.transform(target_row)
+    X_train_scaled = scaler.transform(X_train_raw) if scaler is not None else X_train_raw.values
+    target_scaled = scaler.transform(target_row) if scaler is not None else target_row.values
 
     explainer = shap.LinearExplainer(ridge, X_train_scaled)
     shap_values = explainer.shap_values(target_scaled)[0]
 
-    label_map = { ... }  # unchanged
+    label_map = {
+        "temperature_2m": "Temperature", "relative_humidity_2m": "Humidity",
+        "surface_pressure": "Pressure", "precipitation": "Precipitation",
+        "cloud_cover": "Cloud Cover", "wind_speed_10m": "Wind Speed",
+        "wind_direction_10m": "Wind Direction", "pm2_5": "PM2.5", "pm10": "PM10",
+        "carbon_monoxide": "Carbon Monoxide (CO)", "nitrogen_dioxide": "Nitrogen Dioxide (NO₂)",
+        "sulphur_dioxide": "Sulfur Dioxide (SO₂)", "ozone": "Ozone (O₃)",
+        "us_aqi": "Current AQI", "hour": "Hour of Day", "day": "Day",
+        "month": "Month", "day_of_week": "Day of Week", "is_weekend": "Weekend Flag",
+        "hour_sin": "Hour Cycle (sin)", "hour_cos": "Hour Cycle (cos)",
+        "month_sin": "Season Cycle (sin)", "month_cos": "Season Cycle (cos)",
+        "aqi_change_rate": "AQI Change Rate", "aqi_lag_1h": "AQI 1h Ago",
+        "aqi_lag_24h": "AQI 24h Ago", "aqi_rolling_mean_6h": "AQI 6h Avg",
+        "aqi_rolling_std_6h": "AQI 6h Volatility", "pm25_rolling_mean_6h": "PM2.5 6h Avg"
+    }
 
     contributions = [
         {"feature": label_map.get(f, f), "value": round(float(v), 2)}
