@@ -173,11 +173,57 @@ def generate_72h_forecast(return_features: bool = False):
 
     history_queue = context_history.copy()
     predicted_aqis, predicted_times = [], []
-    feature_rows = []  # NEW — one X_step per forecast hour
+    feature_rows = []  # one X_step per forecast hour
 
     for _, row in future.iterrows():
         current_time = row["datetime"]
-        # ... unchanged lag/rolling/pollutant feature-building code ...
+
+        lag_1h = float(history_queue.iloc[-1]["us_aqi"])
+        lag_24h = float(
+            history_queue.iloc[-24]["us_aqi"]
+            if len(history_queue) >= 24
+            else history_queue.iloc[0]["us_aqi"]
+        )
+        lag_2h = float(
+            history_queue.iloc[-2]["us_aqi"] if len(history_queue) >= 2 else lag_1h
+        )
+
+        rolling_6h_aqi = history_queue.tail(6)["us_aqi"]
+        rolling_mean_6h = float(rolling_6h_aqi.mean())
+        std_val = rolling_6h_aqi.std()
+        rolling_std_6h = float(std_val) if not np.isnan(std_val) else 0.0
+        rolling_mean_6h_pm25 = float(history_queue.tail(6)["pm2_5"].mean())
+        aqi_change_rate = float((lag_1h - lag_2h) / (lag_2h + 1e-5))
+
+        pm2_5_pred = float(history_queue.iloc[-1]["pm2_5"]) * 0.98 + (rolling_mean_6h_pm25 * 0.02)
+        pm10_pred = float(history_queue.iloc[-1]["pm10"]) * 0.98
+        co_pred = float(history_queue.iloc[-1]["carbon_monoxide"])
+        no2_pred = float(history_queue.iloc[-1]["nitrogen_dioxide"])
+        so2_pred = float(history_queue.iloc[-1]["sulphur_dioxide"])
+        o3_pred = float(history_queue.iloc[-1]["ozone"])
+
+        feature_dict = {
+            "temperature_2m": float(row["temperature_2m"]),
+            "relative_humidity_2m": float(row["relative_humidity_2m"]),
+            "surface_pressure": float(row["surface_pressure"]),
+            "precipitation": float(row["precipitation"]),
+            "cloud_cover": float(row["cloud_cover"]),
+            "wind_speed_10m": float(row["wind_speed_10m"]),
+            "wind_direction_10m": float(row["wind_direction_10m"]),
+            "pm2_5": pm2_5_pred, "pm10": pm10_pred,
+            "carbon_monoxide": co_pred, "nitrogen_dioxide": no2_pred,
+            "sulphur_dioxide": so2_pred, "ozone": o3_pred,
+            "us_aqi": lag_1h,
+            "hour": int(row["hour"]), "day": int(row["day"]), "month": int(row["month"]),
+            "day_of_week": int(row["day_of_week"]), "is_weekend": int(row["is_weekend"]),
+            "hour_sin": float(row["hour_sin"]), "hour_cos": float(row["hour_cos"]),
+            "month_sin": float(row["month_sin"]), "month_cos": float(row["month_cos"]),
+            "aqi_change_rate": aqi_change_rate,
+            "aqi_lag_1h": lag_1h, "aqi_lag_24h": lag_24h,
+            "aqi_rolling_mean_6h": rolling_mean_6h,
+            "aqi_rolling_std_6h": rolling_std_6h,
+            "pm25_rolling_mean_6h": rolling_mean_6h_pm25
+        }
 
         X_step = pd.DataFrame([feature_dict])
         for col in feature_cols:
@@ -188,7 +234,7 @@ def generate_72h_forecast(return_features: bool = False):
         predicted_value = max(0.0, float(model.predict(X_step)[0]))
         predicted_aqis.append(predicted_value)
         predicted_times.append(current_time)
-        feature_rows.append(X_step.iloc[0])  # NEW
+        feature_rows.append(X_step.iloc[0])
 
         new_obs = feature_dict.copy()
         new_obs["datetime"] = current_time
