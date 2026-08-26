@@ -6,8 +6,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 import os
-
-
+from zoneinfo import ZoneInfo
+PKT = ZoneInfo("Asia/Karachi")
 # ═══════════════════════════════════════════════════════════
 # STREAMLIT CONFIGURATION (DARK MODE)
 # ═══════════════════════════════════════════════════════════
@@ -234,10 +234,12 @@ with c2:
         unsafe_allow_html=True
     )
 with c3:
+    now_pkt = datetime.now(PKT)
     st.markdown(
-        f"<div class='muted' style='padding-top:10px; text-align:right;'>Updated {datetime.now().strftime('%I:%M %p')}</div>",
+        f"<div class='muted' style='padding-top:10px; text-align:right;'>Updated {now_pkt.strftime('%I:%M %p')} PKT</div>",
         unsafe_allow_html=True
     )
+    
     if st.button("🔄 Refresh Data", use_container_width=True, key="refresh_btn"):
         st.cache_data.clear()
         st.rerun()
@@ -548,11 +550,12 @@ try:
             unsafe_allow_html=True
         )
 
-    st.markdown("---")
-    st.caption(
+        st.markdown("---")
+        ingested_dt = pd.to_datetime(current["timestamp"])
+        st.caption(
         f"10Pearls AQI Predictor · Air-quality intelligence for Lahore, Punjab, Pakistan · "
-        f"Last Data Ingested: {current['timestamp']}"
-    )
+        f"Last Data Ingested: {ingested_dt.strftime('%b %d, %Y %I:%M %p')} PKT"
+)
 
 except Exception as e:
     st.error(f"❌ Error connecting to Backend API: `{e}`")
