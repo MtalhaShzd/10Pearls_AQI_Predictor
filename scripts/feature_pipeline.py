@@ -316,10 +316,17 @@ def upload_to_hopsworks(combined_df: pd.DataFrame) -> bool:
     print(f"   Sending {len(upload_df)} rows ({n_missing} missing, "
           f"{len(upload_df) - n_missing} re-sent to refresh lag features)")
 
-    # datetime is the primary key, so overlapping rows upsert rather than duplicate.
-    fg.insert(upload_df, write_options={"wait_for_job": False})
+    try:
+        # datetime is the primary key, so overlapping rows upsert rather than duplicate.
+        fg.insert(upload_df, write_options={"wait_for_job": False})
+        print(f"✅ Upload complete — latest timestamp sent: {upload_df['datetime'].max()}")
+    except Exception as e:
+        # Don't let a Hopsworks-side failure (quota, outage, etc.) block the
+        # local CSV from being committed — that fallback is what keeps the
+        # dashboard alive while Hopsworks is unavailable.
+        print(f"::warning::Hopsworks upload failed, CSV still updated locally: {e}")
+        return True
 
-    print(f"✅ Upload complete — latest timestamp sent: {upload_df['datetime'].max()}")
     return True
 
 
