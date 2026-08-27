@@ -101,10 +101,15 @@ def load_dataframe(source: str) -> pd.DataFrame:
                 raise RuntimeError("--source hopsworks but HOPSWORKS_API_KEY is not set")
             print("ℹ️ No HOPSWORKS_API_KEY — falling back to local CSV")
         else:
-            print(f"📥 Reading {FG_NAME} v{FG_VERSION} from feature store...")
-            fg = project.get_feature_store().get_feature_group(FG_NAME, version=FG_VERSION)
-            df = fg.read()
-            print(f"   {len(df)} rows retrieved")
+            try:
+                print(f"📥 Reading {FG_NAME} v{FG_VERSION} from feature store...")
+                fg = project.get_feature_store().get_feature_group(FG_NAME, version=FG_VERSION)
+                df = fg.read()
+                print(f"   {len(df)} rows retrieved")
+            except Exception as e:
+                if source == "hopsworks":
+                    raise
+                print(f"⚠️ Feature Store read failed ({e}) — falling back to local CSV")
 
     if df is None:
         if not DATA_PATH.exists():
