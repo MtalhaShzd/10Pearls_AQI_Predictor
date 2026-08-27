@@ -255,6 +255,17 @@ try:
         st.error("❌ Could not load live data from backend API.")
         st.info("💡 Render free instances take ~40 seconds to wake up from sleep. Please wait 30 seconds and click **🔄 Refresh Data**.")
         st.stop()
+
+    degraded = (
+        current.get("source", {}).get("feature_source") != "Hopsworks Feature Store"
+        or forecast.get("source", {}).get("model_source") != "Hopsworks Model Registry"
+    )
+    if degraded:
+        st.warning(
+            "⚠️ Running in fallback mode — serving cached local data because Hopsworks "
+            "is temporarily unavailable (likely free-tier compute quota). Live data will "
+            "resume automatically once access is restored — no action needed."
+        )
     # ═══════════════════════════════════════════════════════════
     # POLLUTANT CARDS
     # ═══════════════════════════════════════════════════════════
