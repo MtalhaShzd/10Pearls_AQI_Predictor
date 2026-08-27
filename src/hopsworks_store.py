@@ -29,6 +29,7 @@ LOCAL_MODEL_DIR = PROJECT_ROOT / "models"
 LOCAL_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "lahore" / "lahore_features_hourly.csv"
 
 FEATURE_CACHE_TTL = int(os.getenv("FEATURE_CACHE_TTL", "900"))  # 15 minutes
+MODEL_CACHE_TTL = int(os.getenv("MODEL_CACHE_TTL", "1800"))     # retry every 30 min while degraded
 
 # In-memory caches
 _MODEL = None
@@ -36,6 +37,7 @@ _FEATURE_COLUMNS = None
 _METRICS = None
 _MODEL_VERSION = None
 _MODEL_SOURCE = "not loaded"
+_MODEL_LOAD_TS = 0.0
 
 _FEATURES_DF = None
 _FEATURES_TS = 0.0
@@ -90,10 +92,17 @@ def _download_model_from_registry():
 
 
 def load_model_artifacts(force_refresh: bool = False):
-    """Load model, feature columns, metrics. Registry first, local fallback."""
-    global _MODEL, _FEATURE_COLUMNS, _METRICS, _MODEL_VERSION, _MODEL_SOURCE
+    """Load model, feature columns, metrics. Registry first, local fallback.
+    Auto-retries Hopsworks every MODEL_CACHE_TTL seconds while running on
+    the local fallback, so the app self-heals once quota/connectivity recovers.
+    """
+    global _MODEL, _FEATURE_COLUMNS, _METRICS, _MODEL_VERSION, _MODEL_SOURCE, _MODEL_LOAD_TS
 
-    if _MODEL is not None and not force_refresh:
+    using_fallback = _MODEL_SOURCE not in (None, "not loaded", "Hopsworks Model Registry")
+    stale = (time.time() - _MODEL_LOAD_TS) > MODEL_CACHE_TTL
+    should_retry = force_refresh or _MODEL is None or (using_fallback and stale)
+
+    if not should_retry:
         return _MODEL, _FEATURE_COLUMNS, _METRICS
 
     artifact_dir = None
@@ -154,6 +163,7 @@ def load_model_artifacts(force_refresh: bool = False):
 
     _METRICS["version"] = version_label
     _METRICS["source"] = source
+    _MODEL_LOAD_TS = time.time()
 
     return _MODEL, _FEATURE_COLUMNS, _METRICS
 
