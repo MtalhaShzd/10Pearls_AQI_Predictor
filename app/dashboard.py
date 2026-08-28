@@ -266,8 +266,10 @@ try:
 
     degraded = (
         current.get("source", {}).get("feature_source") != "Hopsworks Feature Store"
-        or forecast.get("source", {}).get("model_source") != "Hopsworks Model Registry"
+        or (forecast is not None
+            and forecast.get("source", {}).get("model_source") != "Hopsworks Model Registry")
     )
+    
     if degraded:
         st.warning(
             "⚠️ Running in fallback mode — serving cached local data because Hopsworks "
