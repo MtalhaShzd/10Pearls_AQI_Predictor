@@ -215,10 +215,21 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _latest_and_count(df: pd.DataFrame):
+    """Return (latest datetime, row count) for a normalized features df, or (None, 0)."""
+    if df is None or len(df) == 0 or "datetime" not in df.columns:
+        return None, 0
+    return df["datetime"].max(), len(df)
+
+
 def get_features_df(force_refresh: bool = False) -> pd.DataFrame:
     """
-    Get feature data.
-    Priority: in-memory cache (TTL) → Feature Store → local CSV fallback.
+    Get feature data by reading BOTH Hopsworks and the local CSV, then keeping
+    whichever is actually more current (by latest timestamp, row count as a
+    tiebreak). A successful Hopsworks read doesn't guarantee fresh data if the
+    offline materialization job is stuck (e.g. compute quota exhausted) — the
+    local CSV keeps advancing independently via hourly/backfill CI commits.
+    Hopsworks wins exact ties, since it's the source of truth once healthy.
     """
     global _FEATURES_DF, _FEATURES_TS, _FEATURES_SOURCE
 
@@ -226,25 +237,37 @@ def get_features_df(force_refresh: bool = False) -> pd.DataFrame:
     if _FEATURES_DF is not None and not force_refresh and age < FEATURE_CACHE_TTL:
         return _FEATURES_DF.copy()
 
-    df = None
-    source = "local CSV"
-
+    df_hw = None
     try:
-        df = _read_feature_group()
-        source = "Hopsworks Feature Store"
+        df_hw = _normalize(_read_feature_group())
     except Exception as e:
         print(f"⚠️ Feature Store read failed: {e}")
 
-    if df is None or len(df) == 0:
-        if not LOCAL_CSV_PATH.exists():
-            raise FileNotFoundError(
-                "Features unavailable: Feature Store failed and no local CSV exists."
-            )
-        print("ℹ️ Falling back to local CSV")
-        df = pd.read_csv(LOCAL_CSV_PATH)
-        source = "local CSV"
+    df_csv = None
+    if LOCAL_CSV_PATH.exists():
+        try:
+            df_csv = _normalize(pd.read_csv(LOCAL_CSV_PATH))
+        except Exception as e:
+            print(f"⚠️ Local CSV read failed: {e}")
 
-    df = _normalize(df)
+    hw_latest, hw_rows = _latest_and_count(df_hw)
+    csv_latest, csv_rows = _latest_and_count(df_csv)
+
+    if hw_latest is None and csv_latest is None:
+        raise FileNotFoundError(
+            "Features unavailable: Feature Store failed and no local CSV exists."
+        )
+    elif hw_latest is None:
+        df, source = df_csv, "local CSV"
+        print(f"ℹ️ Using local CSV ({csv_rows} rows, latest {csv_latest}) — Hopsworks unavailable")
+    elif csv_latest is None:
+        df, source = df_hw, "Hopsworks Feature Store"
+    elif csv_latest > hw_latest:
+        df, source = df_csv, "local CSV"
+        print(f"ℹ️ Local CSV is newer (latest {csv_latest}, {csv_rows} rows) than "
+              f"Hopsworks (latest {hw_latest}, {hw_rows} rows) — using local CSV")
+    else:
+        df, source = df_hw, "Hopsworks Feature Store"
 
     _FEATURES_DF = df
     _FEATURES_TS = time.time()
