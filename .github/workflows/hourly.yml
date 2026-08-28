@@ -2,7 +2,7 @@ name: Hourly Feature Pipeline
 
 on:
   schedule:
-    - cron: "23 * * * *"      # :15 gives Open-Meteo time to publish the hour
+    - cron: "23 * * * *"      #    gives Open-Meteo time to publish the hour
   workflow_dispatch:
     inputs:
       past_days:
