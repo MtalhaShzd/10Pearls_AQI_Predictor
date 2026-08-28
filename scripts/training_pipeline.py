@@ -85,15 +85,23 @@ def hopsworks_login():
 # --------------------------------------------------------------------------
 # DATA
 # --------------------------------------------------------------------------
+def _prep(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+    return (df.drop_duplicates(subset="datetime", keep="last")
+              .sort_values("datetime").reset_index(drop=True))
+
+
 def load_dataframe(source: str) -> pd.DataFrame:
-    """Load features. Hopsworks is the source of truth; CSV is a fallback.
+    """Load features. For --source auto, reads BOTH Hopsworks and the local
+    CSV and keeps whichever is actually more current — a successful Hopsworks
+    read doesn't guarantee fresh data if offline materialization is stuck
+    (e.g. compute quota exhausted). Hopsworks wins exact ties.
 
-    FIX: the old version trained from the CSV only. On ephemeral CI runners
-    that CSV is whatever git has committed, so the model could silently train
-    on stale data while the feature store moved on.
+    --source hopsworks / --source csv bypass the comparison and force that
+    exact source, raising if it's unavailable.
     """
-    df = None
-
+    df_hw = None
     if source in ("auto", "hopsworks"):
         project = hopsworks_login()
         if project is None:
@@ -104,25 +112,45 @@ def load_dataframe(source: str) -> pd.DataFrame:
             try:
                 print(f"📥 Reading {FG_NAME} v{FG_VERSION} from feature store...")
                 fg = project.get_feature_store().get_feature_group(FG_NAME, version=FG_VERSION)
-                df = fg.read()
-                print(f"   {len(df)} rows retrieved")
+                df_hw = _prep(fg.read())
+                print(f"   {len(df_hw)} rows retrieved (latest {df_hw['datetime'].max()})")
             except Exception as e:
                 if source == "hopsworks":
                     raise
                 print(f"⚠️ Feature Store read failed ({e}) — falling back to local CSV")
 
+    if source == "hopsworks":
+        df = df_hw
+    elif source == "csv":
+        if not DATA_PATH.exists():
+            raise FileNotFoundError(f"No CSV at {DATA_PATH}")
+        print(f"📂 Reading local CSV: {DATA_PATH}")
+        df = _prep(pd.read_csv(DATA_PATH, parse_dates=["datetime"]))
+    else:  # auto: compare and pick the fresher one
+        df_csv = None
+        if DATA_PATH.exists():
+            print(f"📂 Reading local CSV: {DATA_PATH}")
+            df_csv = _prep(pd.read_csv(DATA_PATH, parse_dates=["datetime"]))
+            print(f"   {len(df_csv)} rows (latest {df_csv['datetime'].max()})")
+
+        if df_hw is None and df_csv is None:
+            raise FileNotFoundError(f"No feature store access and no CSV at {DATA_PATH}")
+        elif df_hw is None:
+            df = df_csv
+            print("ℹ️ Using local CSV — Hopsworks unavailable")
+        elif df_csv is None:
+            df = df_hw
+        elif df_csv["datetime"].max() > df_hw["datetime"].max():
+            df = df_csv
+            print(f"ℹ️ Local CSV is newer (latest {df_csv['datetime'].max()}) than "
+                  f"Hopsworks (latest {df_hw['datetime'].max()}) — training on local CSV")
+        else:
+            df = df_hw
     if df is None:
         if not DATA_PATH.exists():
             raise FileNotFoundError(f"No feature store access and no CSV at {DATA_PATH}")
         print(f"📂 Reading local CSV: {DATA_PATH}")
         df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
-
-    # CRITICAL: offline-store reads come back UNORDERED.
-    # Without this sort, every lag/target computation below is garbage.
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
-    df = (df.drop_duplicates(subset="datetime", keep="last")
-            .sort_values("datetime")
-            .reset_index(drop=True))
 
     missing = set(FEATURE_COLUMNS + ["datetime"]) - set(df.columns)
     if missing:
