@@ -91,8 +91,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: daily model retrain $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
-
+            git commit -m "chore: daily model retrain $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
           for i in 1 2 3; do
             git pull --rebase --autostash origin main && git push origin main && exit 0
             echo "Push attempt $i failed, retrying..."
