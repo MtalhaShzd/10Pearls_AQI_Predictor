@@ -186,8 +186,14 @@ def get_current_conditions():
     }
 
 
-def generate_72h_forecast(return_features: bool = False):
-    """Recursive 72-hour forecast using Model Registry model + Feature Store data."""
+_FORECAST_CACHE = None          # (forecast_df, features_df) tuple
+_FORECAST_CACHE_TS = 0.0
+FORECAST_CACHE_TTL = int(os.getenv("FORECAST_CACHE_TTL", "600"))  # 10 minutes
+
+
+def _compute_72h_forecast():
+    """The actual recursive forecast loop — unchanged logic, just renamed so
+    generate_72h_forecast() below can wrap it with a cache."""
     model = get_model()
     feature_cols = get_feature_list()
 
@@ -278,11 +284,27 @@ def generate_72h_forecast(return_features: bool = False):
         history_queue = history_queue.tail(24).reset_index(drop=True)
 
     forecast_df_out = pd.DataFrame({"datetime": predicted_times, "predicted_aqi": predicted_aqis})
+    features_df_out = pd.DataFrame(feature_rows).reset_index(drop=True)
+    return forecast_df_out, features_df_out
+
+def generate_72h_forecast(return_features: bool = False):
+    """Recursive 72-hour forecast using Model Registry model + Feature Store data.
+    Cached for FORECAST_CACHE_TTL seconds, since /api/forecast and every
+    /api/shap/* horizon click each trigger the full 72-step recursive loop.
+    """
+    global _FORECAST_CACHE, _FORECAST_CACHE_TS
+
+    now = time.time()
+    if _FORECAST_CACHE is not None and (now - _FORECAST_CACHE_TS) < FORECAST_CACHE_TTL:
+        forecast_df, features_df = _FORECAST_CACHE
+    else:
+        forecast_df, features_df = _compute_72h_forecast()
+        _FORECAST_CACHE = (forecast_df, features_df)
+        _FORECAST_CACHE_TS = now
 
     if return_features:
-        features_df = pd.DataFrame(feature_rows).reset_index(drop=True)
-        return forecast_df_out, features_df
-    return forecast_df_out
+        return forecast_df.copy(), features_df.copy()
+    return forecast_df.copy()
 
 def get_shap_explanation(horizon="24h"):
     """SHAP feature contributions for a specific forecast horizon."""
