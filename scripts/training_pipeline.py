@@ -146,12 +146,7 @@ def load_dataframe(source: str) -> pd.DataFrame:
                   f"Hopsworks (latest {df_hw['datetime'].max()}) — training on local CSV")
         else:
             df = df_hw
-    if df is None:
-        if not DATA_PATH.exists():
-            raise FileNotFoundError(f"No feature store access and no CSV at {DATA_PATH}")
-        print(f"📂 Reading local CSV: {DATA_PATH}")
-        df = pd.read_csv(DATA_PATH, parse_dates=["datetime"])
-
+            
     missing = set(FEATURE_COLUMNS + ["datetime"]) - set(df.columns)
     if missing:
         raise ValueError(f"Dataset missing required columns: {missing}")
