@@ -378,204 +378,205 @@ try:
         predictions = forecast["predictions"]
         metrics = forecast["model_metrics"]
 
-    aqi_24h = predictions[23]["predicted_aqi"]
-    aqi_48h = predictions[47]["predicted_aqi"]
-    aqi_72h = predictions[71]["predicted_aqi"]
+        aqi_24h = predictions[23]["predicted_aqi"]
+        aqi_48h = predictions[47]["predicted_aqi"]
+        aqi_72h = predictions[71]["predicted_aqi"]
 
-    rmse_24h = metrics["test_rmse"] * 1.0
-    rmse_48h = metrics["test_rmse"] * 1.4
-    rmse_72h = metrics["test_rmse"] * 1.8
+        rmse_24h = metrics["test_rmse"] * 1.0
+        rmse_48h = metrics["test_rmse"] * 1.4
+        rmse_72h = metrics["test_rmse"] * 1.8
 
-    hcols = st.columns(3)
-    for col, hrs, aqi_v, rmse_v, day_num in zip(
-        hcols,
-        ["24h", "48h", "72h"],
-        [aqi_24h, aqi_48h, aqi_72h],
-        [rmse_24h, rmse_48h, rmse_72h],
-        ["Day 1", "Day 2", "Day 3"]
-    ):
-        label, color = get_aqi_category(aqi_v)
-        with col:
+        hcols = st.columns(3)
+        for col, hrs, aqi_v, rmse_v, day_num in zip(
+            hcols,
+            ["24h", "48h", "72h"],
+            [aqi_24h, aqi_48h, aqi_72h],
+            [rmse_24h, rmse_48h, rmse_72h],
+            ["Day 1", "Day 2", "Day 3"]
+        ):
+            label, color = get_aqi_category(aqi_v)
+            with col:
+                st.markdown(f"""
+                    <div class="metric-highlight" style="border-top-color:{color};">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-size:18px; font-weight:800;">{hrs}</div>
+                                <div class="muted" style="font-size:13px;">{day_num}</div>
+                            </div>
+                            <div style="background:{color}22; color:{color}; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700;">
+                                ● {label}
+                            </div>
+                        </div>
+                        <div style="display:flex; align-items:baseline; margin-top:18px;">
+                            <span style="font-size:48px; font-weight:900; color:{color};">{aqi_v:.1f}</span>
+                            <span class="muted" style="margin-left:8px; font-weight:600;">predicted AQI</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; padding-top:14px; border-top:1px solid {BORDER}; margin-top:16px;">
+                            <span class="muted" style="font-size:13px;">Model RMSE</span>
+                            <span style="font-size:13px; font-weight:800;">±{rmse_v:.2f}</span>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ═══════════════════════════════════════════════════════════
+        # TREND + MODEL INFO
+        # ═══════════════════════════════════════════════════════════
+        t1, t2 = st.columns([2, 1])
+
+        with t1:
+            st.markdown("### Predicted AQI Trend")
+            chart_df = pd.DataFrame({
+                "Time": ["Today", "24h", "48h", "72h"],
+                "AQI": [current["current_aqi"], aqi_24h, aqi_48h, aqi_72h]
+            })
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(
+                x=chart_df["Time"],
+                y=chart_df["AQI"],
+                mode="lines+markers",
+                line=dict(color="#22c55e", width=4),
+                marker=dict(size=12, color="#16a34a"),
+                hovertemplate="<b>%{x}</b><br>AQI: %{y}<extra></extra>"
+            ))
+            fig2 = style_fig(fig2, height=290)
+            st.plotly_chart(fig2, use_container_width=True, key="chart_predicted_trend")
+
+        with t2:
+            st.markdown("### 🖥️ Prediction System")
             st.markdown(f"""
-                <div class="metric-highlight" style="border-top-color:{color};">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <div style="font-size:18px; font-weight:800;">{hrs}</div>
-                            <div class="muted" style="font-size:13px;">{day_num}</div>
-                        </div>
-                        <div style="background:{color}22; color:{color}; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700;">
-                            ● {label}
-                        </div>
+                <div class="conditions-card">
+                    <div class="muted" style="font-size:12px; font-weight:700;">⏱ HORIZONS</div>
+                    <div style="font-size:16px; font-weight:800;">24 / 48 / 72 hours</div>
+                </div>
+                <div class="conditions-card">
+                    <div class="muted" style="font-size:12px; font-weight:700;">📊 PREDICTION TYPE</div>
+                    <div style="font-size:16px; font-weight:800;">ML Forecast (Model {metrics['version']})</div>
+                </div>
+                <div class="conditions-card">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                        <span class="muted">24h model error</span>
+                        <span style="font-weight:800;">RMSE ±{rmse_24h:.2f}</span>
                     </div>
-                    <div style="display:flex; align-items:baseline; margin-top:18px;">
-                        <span style="font-size:48px; font-weight:900; color:{color};">{aqi_v:.1f}</span>
-                        <span class="muted" style="margin-left:8px; font-weight:600;">predicted AQI</span>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                        <span class="muted">48h model error</span>
+                        <span style="font-weight:800;">RMSE ±{rmse_48h:.2f}</span>
                     </div>
-                    <div style="display:flex; justify-content:space-between; padding-top:14px; border-top:1px solid {BORDER}; margin-top:16px;">
-                        <span class="muted" style="font-size:13px;">Model RMSE</span>
-                        <span style="font-size:13px; font-weight:800;">±{rmse_v:.2f}</span>
+                    <div style="display:flex; justify-content:space-between;">
+                        <span class="muted">72h model error</span>
+                        <span style="font-weight:800;">RMSE ±{rmse_72h:.2f}</span>
                     </div>
                 </div>
             """, unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("---")
 
-    # ═══════════════════════════════════════════════════════════
-    # TREND + MODEL INFO
-    # ═══════════════════════════════════════════════════════════
-    t1, t2 = st.columns([2, 1])
+        # ═══════════════════════════════════════════════════════════
+        # HOURLY 72-HOUR FORECAST TABLE + CSV DOWNLOAD
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("### 📋 Hourly Forecast Data")
+        st.caption("Detailed 72-hour predictions with health classifications")
 
-    with t1:
-        st.markdown("### Predicted AQI Trend")
-        chart_df = pd.DataFrame({
-            "Time": ["Today", "24h", "48h", "72h"],
-            "AQI": [current["current_aqi"], aqi_24h, aqi_48h, aqi_72h]
-        })
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(
-            x=chart_df["Time"],
-            y=chart_df["AQI"],
-            mode="lines+markers",
-            line=dict(color="#22c55e", width=4),
-            marker=dict(size=12, color="#16a34a"),
-            hovertemplate="<b>%{x}</b><br>AQI: %{y}<extra></extra>"
-        ))
-        fig2 = style_fig(fig2, height=290)
-        st.plotly_chart(fig2, use_container_width=True, key="chart_predicted_trend")
+        with st.expander("View & Download 72-Hour Hourly Report", expanded=False):
+            df_forecast = pd.DataFrame(predictions)
+            df_forecast = df_forecast[["datetime", "predicted_aqi", "label"]].copy()
+            df_forecast.columns = ["Datetime", "Predicted AQI", "Health Status"]
 
-    with t2:
-        st.markdown("### 🖥️ Prediction System")
-        st.markdown(f"""
-            <div class="conditions-card">
-                <div class="muted" style="font-size:12px; font-weight:700;">⏱ HORIZONS</div>
-                <div style="font-size:16px; font-weight:800;">24 / 48 / 72 hours</div>
-            </div>
-            <div class="conditions-card">
-                <div class="muted" style="font-size:12px; font-weight:700;">📊 PREDICTION TYPE</div>
-                <div style="font-size:16px; font-weight:800;">ML Forecast (Model {metrics['version']})</div>
-            </div>
-            <div class="conditions-card">
-                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                    <span class="muted">24h model error</span>
-                    <span style="font-weight:800;">RMSE ±{rmse_24h:.2f}</span>
-                </div>
-                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                    <span class="muted">48h model error</span>
-                    <span style="font-weight:800;">RMSE ±{rmse_48h:.2f}</span>
-                </div>
-                <div style="display:flex; justify-content:space-between;">
-                    <span class="muted">72h model error</span>
-                    <span style="font-weight:800;">RMSE ±{rmse_72h:.2f}</span>
-                </div>
-            </div>
-        """, unsafe_allow_html=True)
+            st.dataframe(
+                df_forecast.style.format({"Predicted AQI": "{:.2f}"}),
+                use_container_width=True,
+                height=320
+            )
+
+            csv_data = df_forecast.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️ Download 72-Hour Forecast CSV",
+                data=csv_data,
+                file_name=f"lahore_aqi_72h_forecast_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                key="download_csv_btn"
+            )
+
+        # ═══════════════════════════════════════════════════════════
+        # SHAP
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("### 📈 Why This Prediction")
+        st.caption("SHAP feature contributions for the forecast horizon")
+
+        horizon_choice = st.radio(
+            "Select forecast horizon:",
+            ["24h", "48h", "72h"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="horizon_radio"
+        )
+
+        shap_data = fetch_shap(horizon_choice)
+        if shap_data and shap_data.get("success"):
+            contributions = shap_data["contributions"]
+            top_inc = max(contributions, key=lambda x: x["value"])
+            top_dec = min(contributions, key=lambda x: x["value"])
+            pred_val = {"24h": aqi_24h, "48h": aqi_48h, "72h": aqi_72h}[horizon_choice]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Predicted AQI", f"{pred_val:.1f}")
+            m2.metric("📈 Top Increase", f"{top_inc['feature']} (+{top_inc['value']:.2f})")
+            m3.metric("📉 Top Decrease", f"{top_dec['feature']} ({top_dec['value']:.2f})")
+
+            sorted_contrib = sorted(contributions, key=lambda x: x["value"])
+            features_list = [c["feature"] for c in sorted_contrib]
+            values_list = [c["value"] for c in sorted_contrib]
+            colors_list = ["#f59e0b" if v > 0 else "#22c55e" for v in values_list]
+
+            fig_shap = go.Figure(go.Bar(
+                x=values_list,
+                y=features_list,
+                orientation="h",
+                marker_color=colors_list,
+                hovertemplate="<b>%{y}</b><br>SHAP: %{x:.2f}<extra></extra>"
+            ))
+
+            fig_shap.update_layout(
+                height=560,
+                margin=dict(l=20, r=20, t=20, b=40),
+                paper_bgcolor="#111827",
+                plot_bgcolor="#111827",
+                font=dict(color="#f8fafc", size=13),
+                xaxis=dict(
+                    title=dict(text="SHAP Contribution", font=dict(color="#f8fafc", size=13)),
+                    tickfont=dict(color="#f8fafc", size=12),
+                    gridcolor="rgba(148,163,184,0.18)",
+                    zeroline=True,
+                    zerolinecolor="#94a3b8",
+                    zerolinewidth=1.5,
+                    color="#f8fafc"
+                ),
+                yaxis=dict(
+                    tickfont=dict(color="#f8fafc", size=13),
+                    automargin=True,
+                    color="#f8fafc"
+                )
+            )
+
+            st.plotly_chart(fig_shap, use_container_width=True, key="chart_shap")
+
+            st.markdown(
+                "<div class='muted' style='text-align:center;'>"
+                "🟠 Increases predicted AQI &nbsp;&nbsp; 🟢 Decreases predicted AQI"
+                "</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            st.info("📈 SHAP explanation is temporarily unavailable — will retry on next refresh.")
 
     st.markdown("---")
-
-    # ═══════════════════════════════════════════════════════════
-    # HOURLY 72-HOUR FORECAST TABLE + CSV DOWNLOAD
-    # ═══════════════════════════════════════════════════════════
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("### 📋 Hourly Forecast Data")
-    st.caption("Detailed 72-hour predictions with health classifications")
-
-    with st.expander("View & Download 72-Hour Hourly Report", expanded=False):
-        df_forecast = pd.DataFrame(predictions)
-        df_forecast = df_forecast[["datetime", "predicted_aqi", "label"]].copy()
-        df_forecast.columns = ["Datetime", "Predicted AQI", "Health Status"]
-
-        st.dataframe(
-            df_forecast.style.format({"Predicted AQI": "{:.2f}"}),
-            use_container_width=True,
-            height=320
-        )
-
-        csv_data = df_forecast.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download 72-Hour Forecast CSV",
-            data=csv_data,
-            file_name=f"lahore_aqi_72h_forecast_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            key="download_csv_btn"
-        )
-
-    # ═══════════════════════════════════════════════════════════
-    # SHAP
-    # ═══════════════════════════════════════════════════════════
-    st.markdown("### 📈 Why This Prediction")
-    st.caption("SHAP feature contributions for the forecast horizon")
-
-    horizon_choice = st.radio(
-        "Select forecast horizon:",
-        ["24h", "48h", "72h"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="horizon_radio"
-    )
-
-    shap_data = fetch_shap(horizon_choice)
-    if shap_data and shap_data.get("success"):
-        contributions = shap_data["contributions"]
-        top_inc = max(contributions, key=lambda x: x["value"])
-        top_dec = min(contributions, key=lambda x: x["value"])
-        pred_val = {"24h": aqi_24h, "48h": aqi_48h, "72h": aqi_72h}[horizon_choice]
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Predicted AQI", f"{pred_val:.1f}")
-        m2.metric("📈 Top Increase", f"{top_inc['feature']} (+{top_inc['value']:.2f})")
-        m3.metric("📉 Top Decrease", f"{top_dec['feature']} ({top_dec['value']:.2f})")
-
-        sorted_contrib = sorted(contributions, key=lambda x: x["value"])
-        features_list = [c["feature"] for c in sorted_contrib]
-        values_list = [c["value"] for c in sorted_contrib]
-        colors_list = ["#f59e0b" if v > 0 else "#22c55e" for v in values_list]
-
-        fig_shap = go.Figure(go.Bar(
-            x=values_list,
-            y=features_list,
-            orientation="h",
-            marker_color=colors_list,
-            hovertemplate="<b>%{y}</b><br>SHAP: %{x:.2f}<extra></extra>"
-        ))
-
-        # Safe Plotly axis styling
-        fig_shap.update_layout(
-            height=560,
-            margin=dict(l=20, r=20, t=20, b=40),
-            paper_bgcolor="#111827",
-            plot_bgcolor="#111827",
-            font=dict(color="#f8fafc", size=13),
-            xaxis=dict(
-                title=dict(text="SHAP Contribution", font=dict(color="#f8fafc", size=13)),
-                tickfont=dict(color="#f8fafc", size=12),
-                gridcolor="rgba(148,163,184,0.18)",
-                zeroline=True,
-                zerolinecolor="#94a3b8",
-                zerolinewidth=1.5,
-                color="#f8fafc"
-            ),
-            yaxis=dict(
-                tickfont=dict(color="#f8fafc", size=13),
-                automargin=True,
-                color="#f8fafc"
-            )
-        )
-
-        st.plotly_chart(fig_shap, use_container_width=True, key="chart_shap")
-
-        st.markdown(
-            "<div class='muted' style='text-align:center;'>"
-            "🟠 Increases predicted AQI &nbsp;&nbsp; 🟢 Decreases predicted AQI"
-            "</div>",
-            unsafe_allow_html=True
-        )
-
-        st.markdown("---")
-        ingested_dt = pd.to_datetime(current["timestamp"])
-        st.caption(
+    ingested_dt = pd.to_datetime(current["timestamp"])
+    st.caption(
         f"10Pearls AQI Predictor · Air-quality intelligence for Lahore, Punjab, Pakistan · "
         f"Last Data Ingested: {ingested_dt.strftime('%b %d, %Y %I:%M %p')} PKT"
-)
+    )
 
 except Exception as e:
     st.error(f"❌ Error connecting to Backend API: `{e}`")
