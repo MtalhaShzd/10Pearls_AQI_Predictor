@@ -2,8 +2,10 @@
 
 import os
 import json
+import time
 import warnings
 import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 
@@ -73,8 +75,27 @@ def get_data_source_info():
     return get_source_info()
 
 
+_WEATHER_CACHE = None
+_WEATHER_CACHE_TS = 0.0
+WEATHER_CACHE_TTL = int(os.getenv("WEATHER_CACHE_TTL", "900"))  # 15 minutes
+
+
 def fetch_weather_forecast(lat=31.5204, lon=74.3587):
-    """Fetch hourly weather forecast for the next 3 days from Open-Meteo."""
+    """Fetch hourly weather forecast for the next 3 days from Open-Meteo.
+    Cached for WEATHER_CACHE_TTL seconds — /api/forecast and /api/shap both
+    call this on every request, so without caching, opening the dashboard or
+    switching SHAP horizons can trigger repeated Open-Meteo calls in quick
+    succession, which risks 429s (Render's outbound IPs are often shared
+    across many unrelated apps, so this can happen even at modest volume).
+    On a 429/HTTP error, falls back to the last successful cache if one
+    exists, rather than failing the whole forecast outright.
+    """
+    global _WEATHER_CACHE, _WEATHER_CACHE_TS
+
+    now = time.time()
+    if _WEATHER_CACHE is not None and (now - _WEATHER_CACHE_TS) < WEATHER_CACHE_TTL:
+        return _WEATHER_CACHE.copy()
+
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}&hourly="
@@ -82,8 +103,19 @@ def fetch_weather_forecast(lat=31.5204, lon=74.3587):
         f"precipitation,cloud_cover,wind_speed_10m,wind_direction_10m"
         f"&timezone=auto&forecast_days=3"
     )
-    with urllib.request.urlopen(url, timeout=45) as response:
-        data = json.loads(response.read().decode())
+
+    try:
+        with urllib.request.urlopen(url, timeout=45) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        if _WEATHER_CACHE is not None:
+            age_min = int((now - _WEATHER_CACHE_TS) / 60)
+            print(f"⚠️ Open-Meteo request failed (HTTP {e.code}) — "
+                  f"serving weather cache from {age_min} min ago")
+            return _WEATHER_CACHE.copy()
+        raise RuntimeError(
+            f"Open-Meteo unavailable (HTTP {e.code}) and no cached weather to fall back to"
+        ) from e
 
     hourly_data = data["hourly"]
     df = pd.DataFrame({
@@ -97,6 +129,9 @@ def fetch_weather_forecast(lat=31.5204, lon=74.3587):
         "wind_direction_10m": hourly_data["wind_direction_10m"]
     })
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+
+    _WEATHER_CACHE = df.copy()
+    _WEATHER_CACHE_TS = now
     return df
 
 
