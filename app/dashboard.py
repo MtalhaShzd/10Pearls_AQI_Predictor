@@ -251,10 +251,18 @@ try:
         current = fetch_current()
         forecast = fetch_forecast()
 
-    if not current or not forecast:
+    if not current:
         st.error("❌ Could not load live data from backend API.")
         st.info("💡 Render free instances take ~40 seconds to wake up from sleep. Please wait 30 seconds and click **🔄 Refresh Data**.")
         st.stop()
+
+    if not forecast:
+        st.warning(
+            "⚠️ The 3-day forecast is temporarily unavailable — the weather data "
+            "provider (Open-Meteo) is rate-limiting requests right now. Current "
+            "conditions below are still live. This resolves on its own within a "
+            "few minutes — try **🔄 Refresh Data** shortly."
+        )
 
     degraded = (
         current.get("source", {}).get("feature_source") != "Hopsworks Feature Store"
@@ -360,14 +368,15 @@ try:
 
     st.markdown("---")
 
-    # ═══════════════════════════════════════════════════════════
-    # FORECAST CARDS
-    # ═══════════════════════════════════════════════════════════
-    st.markdown("### 🤖 AI Air Quality Forecast")
-    st.caption("Predicted AQI for the next three days")
+    if forecast:
+        # ═══════════════════════════════════════════════════════════
+        # FORECAST CARDS
+        # ═══════════════════════════════════════════════════════════
+        st.markdown("### 🤖 AI Air Quality Forecast")
+        st.caption("Predicted AQI for the next three days")
 
-    predictions = forecast["predictions"]
-    metrics = forecast["model_metrics"]
+        predictions = forecast["predictions"]
+        metrics = forecast["model_metrics"]
 
     aqi_24h = predictions[23]["predicted_aqi"]
     aqi_48h = predictions[47]["predicted_aqi"]
