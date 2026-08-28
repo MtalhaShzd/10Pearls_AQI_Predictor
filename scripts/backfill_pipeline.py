@@ -274,8 +274,12 @@ def upload(project, df, affected: pd.DatetimeIndex, full=False):
         return
 
     print(f"\n📤 Upserting {len(out)} rows into {FG_NAME} v{FG_VERSION}...")
-    fg.insert(out, write_options={"wait_for_job": True})
-    print(f"   ✅ Done ({out['datetime'].min()} → {out['datetime'].max()})")
+    try:
+        fg.insert(out, write_options={"wait_for_job": True})
+        print(f"   ✅ Done ({out['datetime'].min()} → {out['datetime'].max()})")
+    except Exception as e:
+        print(f"::warning::Hopsworks materialization failed (likely quota), "
+              f"but the local CSV and Kafka ingestion already succeeded: {e}")
 
 
 # --------------------------------------------------------------------------
