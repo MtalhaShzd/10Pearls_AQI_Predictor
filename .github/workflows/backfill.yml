@@ -1,6 +1,7 @@
-name: Backfill Pipeline (Manual)
-
+name: Backfill Pipeline
 on:
+  schedule:
+    - cron: "40 */6 * * *"   
   workflow_dispatch:
     inputs:
       start_date:
