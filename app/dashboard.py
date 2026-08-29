@@ -587,3 +587,4 @@ try:
     )
 
 except Exception as e:
+    st.error(f"❌ Error connecting to Backend API: `{e}`")
