@@ -579,6 +579,11 @@ try:
         f"10Pearls AQI Predictor · Air-quality intelligence for Lahore, Punjab, Pakistan · "
         f"Last Data Ingested: {ingested_dt.strftime('%b %d, %Y %I:%M %p')} PKT"
     )
+    st.markdown(
+        "<div class='muted' style='text-align:center; font-size:12px; padding-top:6px;'>"
+        "Developed by Talha Shahzad · 10Pearls Shine Internship Program"
+        "</div>",
+        unsafe_allow_html=True
+    )
 
 except Exception as e:
-    st.error(f"❌ Error connecting to Backend API: `{e}`")
