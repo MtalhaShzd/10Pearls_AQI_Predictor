@@ -80,6 +80,31 @@ _WEATHER_CACHE_TS = 0.0
 WEATHER_CACHE_TTL = int(os.getenv("WEATHER_CACHE_TTL", "900"))  # 15 minutes
 
 
+def _synthesize_weather_from_history(lat=31.5204, lon=74.3587):
+    """Cold-start fallback when Open-Meteo fails AND no in-memory weather
+    cache exists yet (e.g. right after a Render restart, before any request
+    has succeeded). Builds a flat 72-hour weather forecast by repeating the
+    most recent known weather readings from local feature data — not a real
+    forecast, but keeps the AQI model runnable instead of failing outright
+    until Open-Meteo (or the cache) recovers.
+    """
+    historical_df = get_features_df().sort_values("datetime").reset_index(drop=True)
+    latest = historical_df.iloc[-1]
+    last_time = pd.to_datetime(latest["datetime"])
+
+    times = pd.date_range(last_time + pd.Timedelta(hours=1), periods=72, freq="h")
+    return pd.DataFrame({
+        "datetime": times,
+        "temperature_2m": float(latest["temperature_2m"]),
+        "relative_humidity_2m": float(latest["relative_humidity_2m"]),
+        "surface_pressure": float(latest["surface_pressure"]),
+        "precipitation": 0.0,
+        "cloud_cover": float(latest["cloud_cover"]),
+        "wind_speed_10m": float(latest["wind_speed_10m"]),
+        "wind_direction_10m": float(latest["wind_direction_10m"]),
+    })
+
+
 def fetch_weather_forecast(lat=31.5204, lon=74.3587):
     """Fetch hourly weather forecast for the next 3 days from Open-Meteo.
     Cached for WEATHER_CACHE_TTL seconds — /api/forecast and /api/shap both
@@ -113,9 +138,10 @@ def fetch_weather_forecast(lat=31.5204, lon=74.3587):
             print(f"⚠️ Open-Meteo request failed (HTTP {e.code}) — "
                   f"serving weather cache from {age_min} min ago")
             return _WEATHER_CACHE.copy()
-        raise RuntimeError(
-            f"Open-Meteo unavailable (HTTP {e.code}) and no cached weather to fall back to"
-        ) from e
+
+        print(f"⚠️ Open-Meteo request failed (HTTP {e.code}) and no weather cache yet "
+              f"(likely just after a restart) — synthesizing weather from latest local readings")
+        return _synthesize_weather_from_history(lat, lon)
 
     hourly_data = data["hourly"]
     df = pd.DataFrame({
