@@ -513,6 +513,65 @@ GET /api/shap/24h
 
 Returns SHAP contributions used by the dashboard to explain the selected prediction.
 
+### Health Check
+
+```http
+GET /health
+```
+
+Returns a simple service-level health status, separate from the root `/` check.
+
+---
+
+### List Available Routes
+
+```http
+GET /routes
+```
+
+Returns a list of all registered API endpoints — useful for verifying deployment.
+
+---
+
+### Data Source Status
+
+```http
+GET /api/source
+```
+
+Returns which data source (Hopsworks or local CSV fallback) and which
+model source (Hopsworks Model Registry or local artifact) are
+currently being served, along with row counts and cache age. Used by
+the dashboard to detect and display fallback/degraded-mode status.
+
+Example response:
+
+```json
+{
+  "success": true,
+  "source": {
+    "feature_source": "Hopsworks Feature Store",
+    "model_source": "Hopsworks Model Registry",
+    "model_version": "v33",
+    "feature_group": "lahore_air_quality_features",
+    "feature_rows": 23283,
+    "cache_age_seconds": 142.6
+  }
+}
+```
+
+---
+
+### Force Reload
+
+```http
+GET /api/reload
+POST /api/reload
+```
+
+Forces a fresh read of both the model and feature data, bypassing the
+in-memory cache. Useful for manually confirming Hopsworks connectivity
+has recovered without waiting for the normal cache TTL to expire.
 ---
 
 # 🔄 CI/CD & Automation
@@ -779,6 +838,67 @@ http://localhost:8501
 > Live URL: https://10pearls-lahore-aqi-predictor.streamlit.app
 
 ---
+---
+
+# ☁️ Deployment
+
+The project is deployed across three separate platforms, each handling
+a different layer of the stack:
+
+| Component              | Platform                | Notes                                      |
+| ----------------------- | ------------------------ | ------------------------------------------- |
+| Flask REST API          | Render (Web Service)     | Runs via Gunicorn; auto-deploys on push to `main` |
+| Streamlit Dashboard     | Streamlit Community Cloud | Auto-deploys on push to `main`             |
+| Feature Store & Model Registry | Hopsworks Serverless | Managed platform; not self-hosted          |
+| CI/CD Automation        | GitHub Actions           | Scheduled + manually-triggerable workflows |
+
+### Live URLs
+
+```text
+API (Render):
+https://one0pearls-aqi-predictor.onrender.com
+
+Dashboard (Streamlit Cloud):
+https://10pearls-lahore-aqi-predictor.streamlit.app
+```
+
+### Render Configuration
+
+The API service runs via Gunicorn rather than Flask's built-in
+development server:
+
+```text
+gunicorn api.app:app --timeout 300 --workers 1 --threads 4 --graceful-timeout 120
+```
+
+Render injects the listening port via the `PORT` environment variable
+at runtime rather than a fixed port. Required environment variables
+(configured in Render's dashboard, not committed to the repo):
+
+```text
+HOPSWORKS_API_KEY
+HOPSWORKS_HOST
+HOPSWORKS_PROJECT
+HOPSWORKS_FEATURE_GROUP
+HOPSWORKS_FEATURE_GROUP_VERSION
+```
+
+### Streamlit Cloud Configuration
+
+The dashboard reads the API's base URL from an environment variable,
+defaulting to the Render deployment above if unset:
+
+```text
+API_URL=https://one0pearls-aqi-predictor.onrender.com
+```
+
+### Free-Tier Constraints
+
+Both Render and Streamlit Cloud's free tiers spin down idle services
+after a period of inactivity, resulting in a cold-start delay
+(typically 30-50 seconds) on the first request after idle time. The
+dashboard surfaces this explicitly to the user rather than presenting
+it as an error.
 
 # 🧪 Research Notebooks
 
