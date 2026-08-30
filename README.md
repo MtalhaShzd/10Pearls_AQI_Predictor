@@ -311,6 +311,7 @@ The Ridge model therefore provides a good balance between:
 * Interpretability
 * Deployment simplicity
 * Explainability
+Model metrics evolve with each daily retraining cycle; the table above reflects results at initial model selection — live metrics are available via /api/forecast
 
 ---
 
@@ -556,7 +557,7 @@ Every hour
 ### Schedule
 
 ```text
-Every day at 02:00 UTC & PST 07:00
+Every day at 02:00 UTC & PKT 07:00
 ```
 
 ### Tasks
