@@ -241,7 +241,7 @@ lahore_air_quality_features
 ### Configuration
 
 ```text
-Version:       1
+Version:       2
 Primary Key:   datetime
 Event Time:    datetime
 Online Store:  Enabled
@@ -429,7 +429,10 @@ The backend is implemented using **Flask**.
 ## Base URL
 
 ```text
+local host
 http://localhost:5000
+Render Api
+https://one0pearls-aqi-predictor.onrender.com
 ```
 
 ## Endpoints
@@ -570,7 +573,7 @@ Every day at 02:00 UTC & PST 07:00
 
 ---
 
-## Manual Backfill Pipeline
+## Backfill Pipeline
 
 **Workflow:**
 
@@ -578,7 +581,7 @@ Every day at 02:00 UTC & PST 07:00
 .github/workflows/backfill.yml
 ```
 
-The workflow can be manually triggered when historical data contains gaps or requires backfilling.
+The workflow runs after every 6 hours for backfilling the gaps or when historical data contains gaps or requires backfilling.
 
 ---
 
@@ -672,6 +675,7 @@ Pearls_AQI_Predictor/
 │
 ├── src/
 │   └── forecast_engine.py
+|   └── hopsworks_store.py
 │
 ├── tests/
 │
@@ -770,6 +774,8 @@ http://localhost:8501
 ```
 
 > The Streamlit dashboard communicates with the Flask API for current AQI, forecasts and SHAP explanations.
+> Deployed at Streamlit Cloud and Render
+> Live URL: https://10pearls-lahore-aqi-predictor.streamlit.app
 
 ---
 
@@ -892,18 +898,13 @@ Potential improvements include:
 * More advanced multi-step forecasting strategies
 * Additional cities and geographical regions
 * Weather forecast uncertainty integration
-* Real-time alert notifications
-* Docker-based deployment
-* Cloud deployment of the API and dashboard
-* Automated model comparison during retraining
-
 ---
 
 # 🤝 Contributing
 
 This project was developed as part of the **10Pearls Shine Internship Program**.
 
-Suggestions, improvements and issue reports are welcome.
+Suggestions, and improvements are welcome.
 
 ---
 
