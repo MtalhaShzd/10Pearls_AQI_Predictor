@@ -1052,8 +1052,8 @@ Data Science / AI & MLOps Project
 
 The full technical report — covering system architecture, methodology, model evaluation, resilience engineering, and a detailed log of production challenges and their resolutions — is available here:
 
-- 📥 **Download (GitHub):** [Pearls_AQI_Predictor_Report.pdf](docs/Pearls_AQI_Predictor_Report.pdf)
-- 📖 **View Online (Google Drive):** [Pearls AQI Predictor — Technical Report](https://drive.google.com/file/d/1cpcCwbP05ACp0devY_1jKa2W8P1a-mSd/view?usp=sharing)
+- 📥 **Download (GitHub):** [10Pearls_AQI_Predictor_Technical_Report.pdf](docs/10Pearls_AQI_Predictor_Technical_Report.pdf)
+- 📖 **View Online (Google Drive):** [10Pearls AQI Predictor — Technical Report](https://drive.google.com/file/d/1cpcCwbP05ACp0devY_1jKa2W8P1a-mSd/view?usp=sharing)
 
 > If GitHub's inline preview have some issues, download the file and open it — it will populate automatically.
 
