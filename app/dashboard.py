@@ -310,21 +310,7 @@ try:
             </div>
         """, unsafe_allow_html=True)
 
-    if hazard_aqi > 300:
-        st.error(
-            f"🚨 HAZARDOUS AIR QUALITY — AQI {hazard_aqi:.0f} in {hazard_source}. "
-            f"Avoid all outdoor exertion. Everyone should remain indoors with windows closed."
-        )
-    elif hazard_aqi > 200:
-        st.warning(
-            f"⚠️ Very Unhealthy air quality expected — AQI {hazard_aqi:.0f} in {hazard_source}. "
-            f"Limit outdoor exposure, especially for children, elderly, and those with respiratory conditions."
-        )
-
     st.markdown("<br>", unsafe_allow_html=True)
-    # ═══════════════════════════════════════════════════════════
-    # POLLUTANT CARDS
-    # ═══════════════════════════════════════════════════════════
     # ═══════════════════════════════════════════════════════════
     # POLLUTANT CARDS
     # ═══════════════════════════════════════════════════════════
