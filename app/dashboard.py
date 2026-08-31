@@ -284,7 +284,7 @@ try:
             hazard_aqi = forecast_max
             hazard_source = "next 24 hours"
 
-    st.markdown("##### 🎨 AQI Scale")
+    st.markdown("#####  AQI Scale")
     st.caption(f"Active level shown based on {hazard_source} — AQI {hazard_aqi:.0f}")
 
     aqi_bands = [
@@ -305,7 +305,7 @@ try:
         col.markdown(f"""
             <div style="background:{color}22; border:{border}; {glow} opacity:{opacity};
                         border-radius:12px; padding:10px 6px; text-align:center;">
-                <div style="font-size:11px; font-weight:700; color:{color};">{low}-{high if high<500 else '+'}</div>
+                <div style="font-size:11px; font-weight:700; color:{color};">{low}+</div>
                 <div style="font-size:10px; color:{TEXT_MUTED}; margin-top:2px;">{label}</div>
             </div>
         """, unsafe_allow_html=True)
