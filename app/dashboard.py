@@ -276,6 +276,55 @@ try:
             "is temporarily unavailable (likely free-tier compute quota). Live data will "
             "resume automatically once access is restored — no action needed."
         )
+    hazard_aqi = current["current_aqi"]
+    hazard_source = "current conditions"
+    if forecast:
+        forecast_max = max(p["predicted_aqi"] for p in forecast["predictions"][:24])
+        if forecast_max > hazard_aqi:
+            hazard_aqi = forecast_max
+            hazard_source = "next 24 hours"
+
+    st.markdown("##### 🎨 AQI Scale")
+    st.caption(f"Active level shown based on {hazard_source} — AQI {hazard_aqi:.0f}")
+
+    aqi_bands = [
+        (0, 50, "Good", "#22c55e"),
+        (51, 100, "Moderate", "#eab308"),
+        (101, 150, "Unhealthy (Sensitive)", "#f97316"),
+        (151, 200, "Unhealthy", "#ef4444"),
+        (201, 300, "Very Unhealthy", "#a855f7"),
+        (301, 500, "Hazardous", "#7f1d1d"),
+    ]
+
+    scale_cols = st.columns(6)
+    for col, (low, high, label, color) in zip(scale_cols, aqi_bands):
+        is_active = low <= hazard_aqi <= high or (high == 500 and hazard_aqi > 300)
+        border = f"3px solid {color}" if is_active else f"1px solid {BORDER}"
+        glow = f"box-shadow: 0 0 14px {color}88;" if is_active else ""
+        opacity = "1" if is_active else "0.55"
+        col.markdown(f"""
+            <div style="background:{color}22; border:{border}; {glow} opacity:{opacity};
+                        border-radius:12px; padding:10px 6px; text-align:center;">
+                <div style="font-size:11px; font-weight:700; color:{color};">{low}-{high if high<500 else '+'}</div>
+                <div style="font-size:10px; color:{TEXT_MUTED}; margin-top:2px;">{label}</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    if hazard_aqi > 300:
+        st.error(
+            f"🚨 HAZARDOUS AIR QUALITY — AQI {hazard_aqi:.0f} in {hazard_source}. "
+            f"Avoid all outdoor exertion. Everyone should remain indoors with windows closed."
+        )
+    elif hazard_aqi > 200:
+        st.warning(
+            f"⚠️ Very Unhealthy air quality expected — AQI {hazard_aqi:.0f} in {hazard_source}. "
+            f"Limit outdoor exposure, especially for children, elderly, and those with respiratory conditions."
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    # ═══════════════════════════════════════════════════════════
+    # POLLUTANT CARDS
+    # ═══════════════════════════════════════════════════════════
     # ═══════════════════════════════════════════════════════════
     # POLLUTANT CARDS
     # ═══════════════════════════════════════════════════════════
