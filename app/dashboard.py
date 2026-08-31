@@ -456,21 +456,31 @@ try:
                     <div class="muted" style="font-size:12px; font-weight:700;">📊 PREDICTION TYPE</div>
                     <div style="font-size:16px; font-weight:800;">ML Forecast (Model {metrics['version']})</div>
                 </div>
-                <div class="conditions-card">
-                    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                        <span class="muted">24h model error</span>
-                        <span style="font-weight:800;">RMSE ±{rmse_24h:.2f}</span>
-                    </div>
-                    <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                        <span class="muted">48h model error</span>
-                        <span style="font-weight:800;">RMSE ±{rmse_48h:.2f}</span>
-                    </div>
-                    <div style="display:flex; justify-content:space-between;">
-                        <span class="muted">72h model error</span>
-                        <span style="font-weight:800;">RMSE ±{rmse_72h:.2f}</span>
-                    </div>
+            <div class="conditions-card">
+                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                    <span class="muted">24h model error</span>
+                    <span style="font-weight:800;">RMSE ±{rmse_24h:.2f}</span>
                 </div>
-            """, unsafe_allow_html=True)
+                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                    <span class="muted">48h model error</span>
+                    <span style="font-weight:800;">RMSE ±{rmse_48h:.2f}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span class="muted">72h model error</span>
+                    <span style="font-weight:800;">RMSE ±{rmse_72h:.2f}</span>
+                </div>
+            </div>
+            <div class="conditions-card">
+                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                    <span class="muted">MAE (test)</span>
+                    <span style="font-weight:800;">{metrics.get('test_mae', 0):.2f}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span class="muted">R² (test)</span>
+                    <span style="font-weight:800;">{metrics.get('test_r2', 0):.4f}</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
 
         st.markdown("---")
 
