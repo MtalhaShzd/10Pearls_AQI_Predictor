@@ -641,7 +641,7 @@ Every day at 02:00 UTC & PKT 07:00
 .github/workflows/backfill.yml
 ```
 
-The workflow runs after every 6 hours for backfilling the gaps or when historical data contains gaps or requires backfilling.
+The workflow runs after every 6 hours for backfilling the gaps or when historical data contains gaps or requires backfilling, currently disabled to save the resources for free tier render minutes, can be manually run and also enabled.
 
 ---
 
