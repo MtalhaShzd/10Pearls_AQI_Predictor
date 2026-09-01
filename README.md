@@ -4,6 +4,8 @@
 
 An end-to-end **Machine Learning and MLOps system** that collects real-time weather and air-quality data, engineers predictive features, stores them in **Hopsworks Feature Store**, trains and evaluates multiple ML models, provides **SHAP-based explainability**, and generates **72-hour recursive AQI forecasts** through a Flask REST API and Streamlit dashboard.
 
+live url: https://10pearls-lahore-aqi-predictor.streamlit.app/
+
 > **Developed as part of the 10Pearls Shine Program — Data Science Learning Path**
 
 ---
