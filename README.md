@@ -1056,8 +1056,12 @@ The full technical report — covering system architecture, methodology, model e
 - 📖 **View Online (Google Drive):** [10Pearls AQI Predictor — Technical Report](https://drive.google.com/file/d/1cpcCwbP05ACp0devY_1jKa2W8P1a-mSd/view?usp=sharing)
 
 > If GitHub's inline preview have some issues, download the file and open it — it will populate automatically.
+> ### 🎥 Video Presentation
+
+- ▶️ **Watch:** [Pearls AQI Predictor — Video Walkthrough](https://drive.google.com/file/d/1gaauyjI2ot0ad83thmZYQ2VCs8rWox_f/view?usp=sharing)
 
 ---
+
 
 ## ⭐ Project Summary
 
