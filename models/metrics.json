@@ -1,11 +1,11 @@
 {
-  "val_mae": 1.7027,
-  "val_rmse": 2.9269,
+  "val_mae": 1.7043,
+  "val_rmse": 2.9355,
   "val_r2": 0.9976,
-  "test_mae": 3.0783,
-  "test_rmse": 5.2753,
-  "test_r2": 0.9764,
-  "baseline_mae": 4.3664,
-  "baseline_rmse": 8.0976,
-  "baseline_r2": 0.9445
+  "test_mae": 3.0829,
+  "test_rmse": 5.2831,
+  "test_r2": 0.9765,
+  "baseline_mae": 4.3914,
+  "baseline_rmse": 8.1198,
+  "baseline_r2": 0.9444
 }
